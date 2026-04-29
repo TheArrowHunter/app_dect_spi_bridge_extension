@@ -5,4 +5,5 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(uart_bridge)
 
 FILE(GLOB app_sources src/*.c)
+zephyr_include_directories(include)
 target_sources(app PRIVATE ${app_sources})
