@@ -10,8 +10,6 @@
 static const struct device *spi_dev = DEVICE_DT_GET(SPI_NODE);
 // Interrupt Data Ready Pin Setup
 static const struct gpio_dt_spec drdy_pin = GPIO_DT_SPEC_GET(DT_ALIAS(drdy_pin), gpios);
-// SPI Transaction Buffer Size
-#define BUF_SIZE 32
 // SPI Configuration:
 static struct spi_config spi_cfg = {
     .frequency = MHZ(2),
@@ -46,8 +44,7 @@ void spi_init(void)
         return;
     }
     gpio_pin_configure_dt(&drdy_pin, GPIO_OUTPUT_INACTIVE);
-
-    printk("SPI API Initialized.\n");
+    memset(tx_buffer, 0xFF, BUF_SIZE);
 }
 
 void spi_set_callback(spi_rx_callback_t cb)
@@ -70,7 +67,7 @@ void spi_send(const char *message)
     // 3. Set the DRDY pin HIGH to interrupt the Teensy Master
     // Since the SPI thread is already waiting with the DMA armed,
     // the Teensy will immediately clock this tx_buffer out.
-    printk("[SPI] Sent: %s\n", tx_buffer);
+    // printk("[SPI] Sent: %s\n", tx_buffer);
     gpio_pin_set_dt(&drdy_pin, 1);
 }
 
@@ -104,7 +101,7 @@ static void spi_listener_thread(void *arg1, void *arg2, void *arg3)
         gpio_pin_set_dt(&drdy_pin, 0);
 
         // clear tx buffer for next message
-        memset(tx_buffer, 0, BUF_SIZE);
+        memset(tx_buffer, 0xFF, BUF_SIZE);
 
         // process data from rx buffer
         if (user_spi_callback != NULL)

@@ -11,6 +11,7 @@ void handle_console_input(const char *input)
 
 void handle_spi_output(const uint8_t *data, uint32_t len)
 {
+
     bool is_dummy = true;
 
     // Cast the pointer so the CPU reads 4 bytes per operation
@@ -32,7 +33,12 @@ void handle_spi_output(const uint8_t *data, uint32_t len)
     {
         return;
     }
-    printk("[SPI] Received: %s\n", data);
+    //printk("[SPI] Received: %s\n", data);
+    spi_send(data);
+    // char combined_message[BUF_SIZE];
+    // snprintf(combined_message, sizeof(combined_message), "echo %s", data);
+    // spi_send(combined_message);
+    return;
 }
 
 int main(void)

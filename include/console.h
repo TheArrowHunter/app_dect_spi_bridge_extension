@@ -10,6 +10,4 @@ typedef void (*console_callback_t)(const char *cmd);
 void console_init(void);
 void console_set_callback(console_callback_t cb);
 
-void spi_send(const char *message);
-
 #endif /* CONSOLE_H */
