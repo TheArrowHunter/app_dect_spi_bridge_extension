@@ -1,51 +1,58 @@
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/gpio.h>
-#include "console.h"
-#include "spi.h"
+#include <zephyr/logging/log.h>
 
-void handle_console_input(const char *input)
+#include "bridge.h"
+
+LOG_MODULE_REGISTER(bridge, LOG_LEVEL_INF);
+
+/* One pool and queue per direction, see bridge.h. */
+K_MEM_SLAB_DEFINE(bridge_frame_slab_dect_tx, sizeof(struct bridge_frame), FRAME_POOL_COUNT, 4);
+K_MEM_SLAB_DEFINE(bridge_frame_slab_spi_tx, sizeof(struct bridge_frame), FRAME_POOL_COUNT, 4);
+K_MSGQ_DEFINE(bridge_dect_tx_q, sizeof(struct bridge_frame *), FRAME_POOL_COUNT, 4);
+K_MSGQ_DEFINE(bridge_spi_tx_q, sizeof(struct bridge_frame *), FRAME_POOL_COUNT, 4);
+
+/* Stats reporter. Runs at the lowest application priority so the log
+ * packaging can never delay a time-critical path; main() is not used for this
+ * because it runs at priority 0, tied with dect.c's tx_tid.
+ */
+static void report_thread(void)
 {
-    printk("[MAIN] Console received: %s\n", input);
-    spi_send(input);
+	while (1)
+	{
+		k_sleep(K_SECONDS(5));
+		LOG_INF("-----");
+		dect_log_stats();
+		LOG_INF("-----");
+		spi_bridge_log_stats();
+	}
 }
 
-void handle_spi_output(const uint8_t *data, uint32_t len)
-{
-
-    bool is_dummy = true;
-
-    // Cast the pointer so the CPU reads 4 bytes per operation
-    const uint32_t *word_data = (const uint32_t *)data;
-
-    // We loop based on words (len / 4). For a 32-byte buffer, this loops 8 times.
-    uint32_t word_count = len / 4;
-
-    for (uint32_t i = 0; i < word_count; i++)
-    {
-        if (word_data[i] != 0xFFFFFFFF)
-        {
-            is_dummy = false;
-            break;
-        }
-    }
-
-    if (is_dummy)
-    {
-        return;
-    }
-    //printk("[SPI] Received: %s\n", data);
-    spi_send(data);
-    // char combined_message[BUF_SIZE];
-    // snprintf(combined_message, sizeof(combined_message), "echo %s", data);
-    // spi_send(combined_message);
-    return;
-}
+K_THREAD_DEFINE(report_tid, 2048, report_thread, NULL, NULL, NULL,
+				K_LOWEST_APPLICATION_THREAD_PRIO, 0, 0);
 
 int main(void)
 {
-    console_init();
-    spi_init();
-    console_set_callback(handle_console_input);
-    spi_set_callback(handle_spi_output);
-    return 0;
+	int err;
+
+	LOG_INF("bridge starting: 2x %u frames of %u B (%u B total pool)",
+			FRAME_POOL_COUNT, (unsigned)sizeof(struct bridge_frame),
+			(unsigned)(2 * FRAME_POOL_COUNT * sizeof(struct bridge_frame)));
+
+	/* SPI first: it configures the handshake GPIOs its thread waits for. */
+	err = spi_bridge_init();
+	if (err)
+	{
+		LOG_ERR("SPI init failed, err %d", err);
+		return err;
+	}
+
+	err = dect_init();
+	if (err)
+	{
+		LOG_ERR("DECT init failed, err %d", err);
+		return err;
+	}
+
+	/* Everything runs in its own threads from here on. */
+	return 0;
 }
