@@ -617,11 +617,18 @@ static uint16_t build_tx_pdu(struct dect_pdu *pdu, uint32_t cycle, uint64_t star
 
 	if (eth_len == 0)
 	{
-		/* Keepalive: eth[] carries the PPS phase, see struct dect_pdu.
-		 * The master's own value is what matters; the master ignores
-		 * the slave's copy.
-		 */
-		memcpy(pdu->eth, &pps_phase_ticks, sizeof(pps_phase_ticks));
+		#if defined(CONFIG_TDMA_ROLE_SLAVE)
+			/* Slave schickt seinen eigenen gemessenen Offset zum Master */
+			int64_t slave_offset = clock_offset;
+			memcpy(pdu->eth, &slave_offset, sizeof(slave_offset));
+		#else
+			/* Master-Keepalive: PPS-Phase für den Slave mitschicken */
+			/* Keepalive: eth[] carries the PPS phase, see struct dect_pdu.
+			* The master's own value is what matters; the master ignores
+			* the slave's copy.
+			*/
+			memcpy(pdu->eth, &pps_phase_ticks, sizeof(pps_phase_ticks));
+		#endif
 	}
 	return eth_len;
 }
@@ -987,9 +994,51 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		 */
 		k_spinlock_key_t key = k_spin_lock(&sync_lock);
 
+		static int64_t round_trip_ns;
+
 		clock_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
 		last_sync_cycle = cycle;
+
+		// Round-trip delay: the master's own measurement of the two-way delay, in ns.
+
+		int64_t slave_offset = 0;
+		memcpy(&slave_offset, pdu->eth, sizeof(slave_offset));
+
+		/* Master berechnet seinen eigenen Offset für diesen Zyklus */
+		int64_t master_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
+
+		/* Die Magie: Durch die Addition löscht sich der Clock Drift (+theta und -theta) komplett aus! */
+		int64_t true_two_way_ticks = master_offset + slave_offset;
+		int64_t true_one_way_ticks = true_two_way_ticks / 2;
+
+		int64_t true_one_way_ns = ticks_to_ns(true_one_way_ticks);
+
+		/* 4. Block-Mittelwert über 100 Samples */
+		static int64_t ns_accumulator = 0;
+		static uint32_t sample_count = 0;
+
+		ns_accumulator += true_one_way_ns;
+		sample_count++;
+
+		// Round-trip delay end 
+
 		k_spin_unlock(&sync_lock, key);
+		
+		// Überprüfung: Wurde der Block von 100 Samples erreicht?
+		if (sample_count >= 5000)
+		{
+			// Exakter arithmetischer Mittelwert des Blocks
+			int64_t avg_one_way_ns = ns_accumulator / sample_count;
+
+			LOG_INF("Block Avg (5000 samples): one-way delay %lld ns (raw sample: %lld ticks / %lld ns)",
+					(long long)avg_one_way_ns,
+					(long long)true_one_way_ticks,
+					(long long)true_one_way_ns);
+
+			// Akkumulator und Zähler für den nächsten 100er-Block zurücksetzen
+			ns_accumulator = 0;
+			sample_count = 0;
+		}
 	}
 #endif
 
