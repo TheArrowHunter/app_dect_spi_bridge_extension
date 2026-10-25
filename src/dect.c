@@ -39,6 +39,186 @@ void log_slave_first_tx(uint32_t start_tick)
     }
 }
 
+#define MAX_ACQ_SAMPLES 5
+
+/* Puffer für die Akquisitions-Offsets */
+static int64_t acq_offsets[MAX_ACQ_SAMPLES];
+static uint8_t acq_sample_count = 0;
+
+/* Payload-Struktur für das allererste TX-Paket */
+struct __attribute__((packed)) first_tx_payload {
+    uint8_t count;                       /* Anzahl gespeicherter Offsets */
+    int64_t offsets[MAX_ACQ_SAMPLES];    /* Die Offsets der Pakete 0, 1, 2... */
+    int64_t final_grid_offset;           /* Der letztlich für das Grid genutzte Offset */
+};
+
+// Ende Sync-Logik
+
+//Histogramm für die Übertragungszeit der Frames
+static uint64_t frame_transmission_time;
+static int64_t delay_ticks; 
+static uint64_t peer_tx_start;
+
+/* ========================================================================= */
+/* START: HOCHPRÄZISES ADAPTIVES HISTOGRAMM                                  */
+/* ========================================================================= */
+
+#define HIST_NUM_BINS         20LL      
+#define HIST_INITIAL_MIN_NS   1440000LL /* Start: 1.440 ms */
+#define HIST_INITIAL_MAX_NS   1448000LL /* Start: 1.448 ms */
+#define HIST_PADDING_NS       500LL     /* 0.5 µs Sicherheitsabstand links/rechts */
+
+struct latency_histogram {
+    uint32_t bins[HIST_NUM_BINS];
+    uint32_t underflow;
+    uint32_t overflow;
+    uint32_t total_samples;
+    int64_t min_measured_ns;
+    int64_t max_measured_ns;
+    int64_t sum_ns;
+
+    int64_t current_min_ns;
+    int64_t current_max_ns;
+    int64_t current_bin_width_ns;
+};
+
+static struct latency_histogram hist = {
+    .min_measured_ns = INT64_MAX,
+    .max_measured_ns = INT64_MIN,
+    .current_min_ns = HIST_INITIAL_MIN_NS,
+    .current_max_ns = HIST_INITIAL_MAX_NS,
+    .current_bin_width_ns = (HIST_INITIAL_MAX_NS - HIST_INITIAL_MIN_NS) / HIST_NUM_BINS
+};
+
+/* ========================================================================= */
+/* ENDE: HOCHPRÄZISES ADAPTIVES HISTOGRAMM                                    */
+/* ========================================================================= */
+
+/**
+ * @brief Sortiert eine gemessene Latenz (in ns) dynamisch in das Histogramm ein.
+ * @param delay_ns Gemessener Delay / Übertragungszeit in Nanosekunden
+ */
+static void histogram_add_sample(int64_t delay_ns)
+{
+    /* Plausibilitätsfilter: Ungültige Werte / Boot-Ausreißer ignorieren */
+    if (delay_ns < 0LL || delay_ns > 10000000LL) {
+        return;
+    }
+
+    hist.total_samples++;
+    hist.sum_ns += delay_ns;
+
+    if (delay_ns < hist.min_measured_ns) hist.min_measured_ns = delay_ns;
+    if (delay_ns > hist.max_measured_ns) hist.max_measured_ns = delay_ns;
+
+    if (delay_ns < hist.current_min_ns) {
+        hist.underflow++;
+        return;
+    }
+    if (delay_ns >= hist.current_max_ns) {
+        hist.overflow++;
+        return;
+    }
+
+    int bin_idx = (int)((delay_ns - hist.current_min_ns) / hist.current_bin_width_ns);
+    if (bin_idx >= HIST_NUM_BINS) {
+        bin_idx = HIST_NUM_BINS - 1;
+    }
+
+    hist.bins[bin_idx]++;
+}
+
+/**
+ * @brief Hilfsfunktion zur Formatierung von Nanosekunden als Millisekunden (z.B. 1.444 ms)
+ */
+static void log_format_ns_as_ms(const char *prefix, int64_t ns_val, const char *suffix)
+{
+    int64_t ms_int = ns_val / 1000000LL;
+    int64_t ms_frac = (ns_val % 1000000LL) / 1000LL; /* Auf Mikrosekunden/3 Nachkommastellen runden */
+    if (ms_frac < 0) ms_frac = -ms_frac;
+
+    LOG_INF("%s%lld.%03lld ms%s", prefix, ms_int, ms_frac, suffix);
+}
+
+/**
+ * @brief Gibt das Histogramm in Millisekunden übersichtlich im Log aus.
+ */
+static void histogram_print_and_reset(void)
+{
+    if (hist.total_samples == 0) {
+        LOG_INF("[HISTOGRAM] Keine gültigen Samples vorhanden.");
+        return;
+    }
+
+    int64_t mean_ns = hist.sum_ns / (int64_t)hist.total_samples;
+
+    int64_t min_ms_int = hist.min_measured_ns / 1000000LL;
+    int64_t min_ms_frac = (hist.min_measured_ns % 1000000LL) / 1000LL;
+    
+    int64_t max_ms_int = hist.max_measured_ns / 1000000LL;
+    int64_t max_ms_frac = (hist.max_measured_ns % 1000000LL) / 1000LL;
+
+    int64_t mean_ms_int = mean_ns / 1000000LL;
+    int64_t mean_ms_frac = (mean_ns % 1000000LL) / 1000LL;
+
+    LOG_INF("================ ADAPTIVE UPLINK HISTOGRAM ================");
+    LOG_INF(" Samples: %u | Min: %lld.%03lld ms | Max: %lld.%03lld ms | Mean: %lld.%03lld ms",
+            hist.total_samples, 
+            min_ms_int, min_ms_frac,
+            max_ms_int, max_ms_frac,
+            mean_ms_int, mean_ms_frac);
+    
+    LOG_INF(" Bin Width: %lld ns | Active Span: %lld ns", 
+            (long long)hist.current_bin_width_ns, 
+            (long long)(hist.current_max_ns - hist.current_min_ns));
+    LOG_INF(" ---------------------------------------------------------------");
+    
+    if (hist.underflow > 0) {
+        LOG_INF("   < %lld.%03lld us : %u samples (UNDERFLOW)", 
+                hist.current_min_ns / 1000LL, hist.current_min_ns % 1000LL, hist.underflow);
+    }
+
+    for (int i = 0; i < HIST_NUM_BINS; i++) {
+        int64_t bin_start_ns = hist.current_min_ns + (i * hist.current_bin_width_ns);
+        int64_t bin_end_ns = bin_start_ns + hist.current_bin_width_ns;
+
+        LOG_INF("   [%4lld.%03lld - %4lld.%03lld us] : %u", 
+                bin_start_ns / 1000LL, bin_start_ns % 1000LL,
+                bin_end_ns / 1000LL, bin_end_ns % 1000LL,
+                hist.bins[i]);
+    }
+
+    if (hist.overflow > 0) {
+        LOG_INF("   >= %lld.%03lld us : %u samples (OVERFLOW)", 
+                hist.current_max_ns / 1000LL, hist.current_max_ns % 1000LL, hist.overflow);
+    }
+    LOG_INF("===============================================================");
+
+    /* ===================================================================== */
+    /* FEINES ZOOMEINSTELLEN FÜR DEN NÄCHSTEN DURCHLAUF                       */
+    /* ===================================================================== */
+    if (hist.min_measured_ns != INT64_MAX && hist.max_measured_ns != INT64_MIN) {
+        /* Sehr enges Padding (500 ns) um die gemessenen Grenzen */
+        hist.current_min_ns = hist.min_measured_ns - HIST_PADDING_NS;
+        hist.current_max_ns = hist.max_measured_ns + HIST_PADDING_NS;
+
+        /* Mindestfenster von 1 µs (1000 ns) halten, damit Bin-Breite >= 50 ns bleibt */
+        if (hist.current_max_ns - hist.current_min_ns < 1000LL) {
+            hist.current_max_ns = hist.current_min_ns + 1000LL;
+        }
+
+        hist.current_bin_width_ns = (hist.current_max_ns - hist.current_min_ns) / HIST_NUM_BINS;
+    }
+
+    memset(hist.bins, 0, sizeof(hist.bins));
+    hist.underflow = 0;
+    hist.overflow = 0;
+    hist.total_samples = 0;
+    hist.sum_ns = 0;
+    hist.min_measured_ns = INT64_MAX;
+    hist.max_measured_ns = INT64_MIN;
+}
+
 BUILD_ASSERT(CONFIG_CARRIER, "Carrier must be configured according to local regulations");
 
 #if defined(CONFIG_TDMA_ROLE_MASTER)
@@ -644,9 +824,22 @@ static uint16_t build_tx_pdu(struct dect_pdu *pdu, uint32_t cycle, uint64_t star
 	if (eth_len == 0)
 	{
 		#if defined(CONFIG_TDMA_ROLE_SLAVE)
-			/* Slave schickt seinen eigenen gemessenen Offset zum Master */
-			int64_t slave_offset = clock_offset;
-			memcpy(pdu->eth, &slave_offset, sizeof(slave_offset));
+			/* Wenn das der allererste TX-Burst ist, schicken wir das Log-Array mit */
+			if (!slave_first_tx_logged) {
+				struct first_tx_payload acq_data = {
+					.count = acq_sample_count,
+					.final_grid_offset = clock_offset
+				};
+				for (int i = 0; i < acq_sample_count; i++) {
+					acq_data.offsets[i] = acq_offsets[i];
+				}
+				memcpy(pdu->eth, &acq_data, sizeof(acq_data));
+			} else {
+				/* Regulärer Betrieb: Nur den aktuellen Offset mitschicken */
+				/* Slave schickt seinen eigenen gemessenen Offset zum Master */
+				int64_t slave_offset = clock_offset;
+				memcpy(pdu->eth, &slave_offset, sizeof(slave_offset));
+			}
 		#else
 			/* Master-Keepalive: PPS-Phase für den Slave mitschicken */
 			/* Keepalive: eth[] carries the PPS phase, see struct dect_pdu.
@@ -987,6 +1180,10 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 	 */
 	len = pdu->app.t_rx.eth_payload_len;
 
+	/* für Histogramme */
+	frame_transmission_time = modem_time;
+	peer_tx_start = unwrap_tx_start(tx_start_lo, stf);
+
 	/* Clock tracking. With a fixed 1-master/1-slave pair, anything arriving
 	 * here is from the peer.
 	 */
@@ -997,6 +1194,16 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 
 		first = !sync_valid;
 		k_spin_unlock(&sync_lock, key);
+
+		//speichere erste Offsets für die spätere Auswertung um die Synchronisation zu überprüfen
+		if (state == STATE_ACQUIRING && acq_sample_count < MAX_ACQ_SAMPLES) {
+			int64_t raw_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
+			acq_offsets[acq_sample_count++] = raw_offset;
+			LOG_INF("[ACQ DATA] Sample #%u Offset: %lld ticks", 
+			        acq_sample_count - 1, (long long)raw_offset);
+		}
+
+		delay_ticks = (int64_t)frame_transmission_time - ((int64_t)peer_tx_start + pps_offset); //Histogramm
 
 		sync_update(cycle, unwrap_tx_start(tx_start_lo, stf), stf);
 
@@ -1045,6 +1252,8 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		clock_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
 		last_sync_cycle = cycle;
 
+		delay_ticks = (int64_t)frame_transmission_time - (int64_t)peer_tx_start; //Histogramm
+
 		// Round-trip delay: the master's own measurement of the two-way delay, in ns.
 
 		int64_t slave_offset = 0;
@@ -1068,6 +1277,34 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 
 		// Round-trip delay end 
 
+		/* Auswertung des ALLERERSTEN Slave-Pakets auf dem Master */
+		if (!master_first_rx_logged) {
+			struct first_tx_payload *acq_data = (struct first_tx_payload *)pdu->eth;
+
+			LOG_INF("========== COLDSTART PRE-SYNC TWO-WAY EVALUATION ==========");
+			LOG_INF("Slave reported %u acquisition samples before Grid-Lock:", acq_data->count);
+
+			if (acq_data->count > 0) {
+				for (int i = 0; i < acq_data->count; i++) {
+					int64_t sample_slave_offset = acq_data->offsets[i];
+					
+					/* Two-Way Delay für dieses Pre-Sync Sample berechnen */
+					int64_t sample_two_way_ticks = master_offset + sample_slave_offset;
+					int64_t sample_one_way_ticks = sample_two_way_ticks / 2;
+					int64_t sample_one_way_ns = ticks_to_ns(sample_one_way_ticks);
+
+					LOG_INF("  [Pre-Sync #%d] S_Off: %lld t | TwoWay: %lld t | OneWay: %lld t (%lld ns)",
+							i,
+							(long long)sample_slave_offset,
+							(long long)sample_two_way_ticks,
+							(long long)sample_one_way_ticks,
+							(long long)sample_one_way_ns);
+				}
+			}
+			LOG_INF("  [Grid Start] Final Used Offset: %lld ticks", 
+			        (long long)acq_data->final_grid_offset);
+			LOG_INF("===========================================================");
+		}
 		k_spin_unlock(&sync_lock, key);
 
 		if (!master_first_rx_logged) {
@@ -1109,11 +1346,11 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 //			{
 				// Umrechnung des Skews in ppb (1 Tick ≈ 14.46 ns bei 69.12 MHz, cycle = 3.33ms)
 				// skew_ticks * 14.468 ns / 0.00333 s ≈ skew_ticks * 4341 ppb
-				LOG_INF("[COLDSTART #%04u] M_Off: %lld t | S_Off: %lld t | TwoWay: %lld t (%lld ns) | Skew: %lld t",
+				LOG_INF("[COLDSTART #%04u] M_Off: %lld t | S_Off: %lld t | OneWay: %lld t | OneWay: %lld ns) | Skew: %lld t",
 						startup_samples,
 						(long long)master_offset,
 						(long long)slave_offset,
-						(long long)true_two_way_ticks,
+						(long long)(true_two_way_ticks/2),
 						(long long)ticks_to_ns(true_two_way_ticks / 2),
 						(long long)clock_skew_ticks);
 //			}
@@ -1138,6 +1375,18 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			deliver_rx(pdu, len, modem_time, pps_offset);
 		}
 	}
+
+	/* In Nanosekunden umrechnen und in das Histogramm einsortieren */
+    int64_t delay_ns = ticks_to_ns(delay_ticks);
+    histogram_add_sample(delay_ns);
+
+    /* Alle 1000 Pakete (~3,3 Sekunden) das Histogramm im Terminal ausgeben */
+    static uint32_t sample_counter = 0;
+    sample_counter++;
+    if (sample_counter >= 1000) {
+        histogram_print_and_reset();
+        sample_counter = 0;
+    }
 }
 
 static void on_pcc_crc_err(const struct nrf_modem_dect_phy_pcc_crc_failure_event *evt)
