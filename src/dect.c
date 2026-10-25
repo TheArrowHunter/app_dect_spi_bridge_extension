@@ -13,6 +13,32 @@
 
 LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
+// erste Master/Slave Nachricht gesendet empfangen
+static bool master_first_tx_logged = false;
+static bool master_first_rx_logged = false;
+static bool slave_first_rx_logged = false;
+static bool slave_first_tx_logged = false;
+
+void log_master_first_tx(uint32_t start_tick)
+{
+    if (!master_first_tx_logged) {
+        master_first_tx_logged = true;
+        int64_t uptime_ms = k_uptime_get();
+        LOG_INF("[TIMING] Master FIRST TX sent at uptime: %lld ms (Tick: %u)", 
+                (long long)uptime_ms, start_tick);
+    }
+}
+
+void log_slave_first_tx(uint32_t start_tick)
+{
+    if (!slave_first_tx_logged) {
+        slave_first_tx_logged = true;
+        int64_t uptime_ms = k_uptime_get();
+        LOG_INF("[TIMING] Slave FIRST TX (Reply) sent at uptime: %lld ms (Tick: %u)", 
+                (long long)uptime_ms, start_tick);
+    }
+}
+
 BUILD_ASSERT(CONFIG_CARRIER, "Carrier must be configured according to local regulations");
 
 #if defined(CONFIG_TDMA_ROLE_MASTER)
@@ -667,6 +693,12 @@ static void schedule_tx(uint32_t cycle)
 		.data_size = TBS_BYTES, /* must equal the TBS exactly */
 	};
 
+	#if defined(CONFIG_TDMA_ROLE_MASTER)
+		log_master_first_tx((uint32_t)start);
+	#else
+		log_slave_first_tx((uint32_t)start);
+	#endif
+
 	err = nrf_modem_dect_phy_tx(&tx);
 	if (err)
 	{
@@ -976,12 +1008,26 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			memcpy(&pps_phase_ticks, pdu->eth, sizeof(pps_phase_ticks));
 			pps_phase_valid = true;
 		}
-
+		static uint32_t message_nr;
 		if (first)
 		{
 			LOG_INF("locked on master cycle %u, offset %lld ticks",
 					cycle, (long long)clock_offset);
 			k_sem_give(&tick_sem);
+			message_nr = 0;
+		}
+
+		if (!slave_first_rx_logged) {
+			slave_first_rx_logged = true;
+			int64_t uptime_ms = k_uptime_get();
+			LOG_INF("[TIMING] Slave FIRST RX (Master Beacon) at uptime: %lld ms (STF: %u)", 
+					(long long)uptime_ms, stf);
+		}
+
+		if (message_nr < 50) {
+			LOG_INF("Slave: Message NR %lld",
+					message_nr);
+			message_nr++;
 		}
 	}
 #else
@@ -1013,7 +1059,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 
 		int64_t true_one_way_ns = ticks_to_ns(true_one_way_ticks);
 
-		/* 4. Block-Mittelwert über 100 Samples */
+		/* 4. Block-Mittelwert über 5000 Samples */
 		static int64_t ns_accumulator = 0;
 		static uint32_t sample_count = 0;
 
@@ -1023,9 +1069,16 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		// Round-trip delay end 
 
 		k_spin_unlock(&sync_lock, key);
+
+		if (!master_first_rx_logged) {
+			master_first_rx_logged = true;
+			int64_t uptime_ms = k_uptime_get();
+			LOG_INF("[TIMING] Master FIRST RX received from Slave at uptime: %lld ms (STF: %u)", 
+					(long long)uptime_ms, stf);
+		}
 		
-		// Überprüfung: Wurde der Block von 100 Samples erreicht?
-		if (sample_count >= 5000)
+		// Überprüfung: Wurde der Block von 5000 Samples erreicht?
+/* 		if (sample_count >= 5000)
 		{
 			// Exakter arithmetischer Mittelwert des Blocks
 			int64_t avg_one_way_ns = ns_accumulator / sample_count;
@@ -1035,10 +1088,39 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 					(long long)true_one_way_ticks,
 					(long long)true_one_way_ns);
 
-			// Akkumulator und Zähler für den nächsten 100er-Block zurücksetzen
+			// Akkumulator und Zähler für den nächsten 5000er-Block zurücksetzen
 			ns_accumulator = 0;
 			sample_count = 0;
+		} */
+
+		/* Statischer Zähler für die empfangenen Samples seit dem Kaltstart */
+		static uint32_t startup_samples = 0;
+		static int64_t prev_slave_offset = 0;
+
+		/* 2. Clock Skew / Drift-Berechnung (Änderung des Slave-Offsets pro Zyklus in Ticks) */
+		int64_t clock_skew_ticks = slave_offset - prev_slave_offset;
+		prev_slave_offset = slave_offset;
+
+		/* 3. High-Frequency Logging für die ersten 5 Sekunden (1500 Samples) */
+		if (startup_samples < 50)
+		{
+			// Ausgabe jedes 10. Samples (~33 ms Raster), um das RTT-Terminal nicht zu überfluten
+//			if (startup_samples % 10 == 0)
+//			{
+				// Umrechnung des Skews in ppb (1 Tick ≈ 14.46 ns bei 69.12 MHz, cycle = 3.33ms)
+				// skew_ticks * 14.468 ns / 0.00333 s ≈ skew_ticks * 4341 ppb
+				LOG_INF("[COLDSTART #%04u] M_Off: %lld t | S_Off: %lld t | TwoWay: %lld t (%lld ns) | Skew: %lld t",
+						startup_samples,
+						(long long)master_offset,
+						(long long)slave_offset,
+						(long long)true_two_way_ticks,
+						(long long)ticks_to_ns(true_two_way_ticks / 2),
+						(long long)clock_skew_ticks);
+//			}
+			
+			startup_samples++;
 		}
+		
 	}
 #endif
 

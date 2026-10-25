@@ -20,7 +20,7 @@ static void report_thread(void)
 	while (1)
 	{
  		k_sleep(K_SECONDS(5));
-/*		LOG_INF("-----");
+/* 		LOG_INF("-----");
 		dect_log_stats();
 		LOG_INF("-----");
 		spi_bridge_log_stats(); */
