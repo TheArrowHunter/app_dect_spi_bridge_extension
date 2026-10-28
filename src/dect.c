@@ -11,6 +11,8 @@
 
 #include "bridge.h"
 
+#include <zephyr/drivers/gpio.h>
+
 LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
 // Bestimmtes Logging an- und ausschalten, um die Latenz zu messen. Nur für Testzwecke!
@@ -18,308 +20,15 @@ LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
 #define CONFIG_ENABLE_COASTING_TIMEOUT 0
 
-#define CONFIG_ENABLE_SKEW_LOGGING 0
+#define CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING 0
 
-#define CONFIG_ENABLE_HISTOGRAM_LOGGING 0
+#define CONFIG_ENABLE_HISTOGRAM_LOGGING 1
 
 #define CONFIG_ENABLE_FIRST_TX_RX_LOGGING 0
 
 #define CONFIG_ENABLE_COLDSTART_LOGGING 0
 
 #define CONFIG_ENABLE_MASTER_CLOCK_SKEW_LOGGING 0
-
-/* 1 Mikrosekunde in 69.12 MHz Modem-Ticks */
-#define MAX_ALLOWED_DESYNC_TICKS   59LL //69LL  /* ~1.000 ns */
-
-#include <zephyr/drivers/gpio.h>
-
-/* Button 1 (sw0) aus dem Devicetree des DK-Boards holen */
-#define SW0_NODE DT_ALIAS(sw0)
-static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
-
-/* Globales Flag für die Sende-Sperre */
-static volatile bool tx_suppressed = false;
-static struct gpio_callback button_cb_data;
-
-/**
- * @brief Interrupt-Handler: Schaltet die Sende-Sperre bei JEDEM Tastendruck um (Toggle)
- */
-static void button1_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    static int64_t last_press_time = 0;
-    int64_t now = k_uptime_get();
-
-    /* Entprellung (Debounce): Tappendrücke innerhalb von 250 ms ignorieren */
-    if (now - last_press_time < 250) {
-        return;
-    }
-    last_press_time = now;
-
-    /* Zustand der Sendesperre umkehren (Toggle) */
-    tx_suppressed = !tx_suppressed;
-
-    if (tx_suppressed) {
-        LOG_WRN("[TEST] Button 1 GEDRÜCKT -> Senden UNTERBROCHEN (Schalter: AUS)");
-    } else {
-        LOG_INF("[TEST] Button 1 GEDRÜCKT -> Senden WIEDERAUFGENOMMEN (Schalter: EIN)");
-    }
-}
-
-/**
- * @brief Initialisiert Button 1 mit Interrupt NUR auf der steigenden Flanke (Drücken)
- */
-void init_test_button(void)
-{
-    int ret;
-
-    if (!gpio_is_ready_dt(&button1)) {
-        LOG_ERR("Error: GPIO Button device not ready");
-        return;
-    }
-
-    ret = gpio_pin_configure_dt(&button1, GPIO_INPUT);
-    if (ret < 0) {
-        LOG_ERR("Error %d: failed to configure button pin", ret);
-        return;
-    }
-
-    /* WICHTIG: Ändern auf GPIO_INT_EDGE_TO_ACTIVE (NUR beim Drücken auslösen, nicht beim Loslassen!) */
-    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
-    if (ret < 0) {
-        LOG_ERR("Error %d: failed to configure interrupt on button pin", ret);
-        return;
-    }
-
-    gpio_init_callback(&button_cb_data, button1_pressed_callback, BIT(button1.pin));
-    gpio_add_callback(button1.port, &button_cb_data);
-    LOG_INF("Button 1 Toggle-Modus (TX On/Off) erfolgreich initialisiert.");
-}
-
-/* Drift-Messung über ein Block-Fenster */
-#define SKEW_CALC_INTERVAL_CYCLES  900u  /* Alle 300 Zyklen (~1 Sekunde) den Skew neu berechnen */
-
-/* Prädiktive Skew-Kompensation für den Freilauf */
-static int64_t learned_skew_ppb = 0;   /* Gelernte Drift in Parts per Billion */
-static int64_t skew_anchor_offset = 0;
-static uint32_t skew_anchor_cycle = 0;
-static bool skew_anchor_valid = false;
-static bool skew_valid = false;
-
-/* Trackt den letzten Zyklus, für den der Skew bereits aufaddiert/kompensiert wurde */
-static uint32_t last_compensated_cycle = 0;
-
-/* Speicher für den gebrochenen Rest (Remainder) in PPB-Ticks */
-static int64_t skew_remainder_ppb_ticks = 0;
-
-// erste Master/Slave Nachricht gesendet empfangen
-static bool master_first_tx_logged = false;
-static bool master_first_rx_logged = false;
-static bool slave_first_rx_logged = false;
-static bool slave_first_tx_logged = false;
-
-void log_master_first_tx(uint32_t start_tick)
-{
-    if (!master_first_tx_logged) {
-        master_first_tx_logged = true;
-        int64_t uptime_ms = k_uptime_get();
-		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
-        LOG_INF("[TIMING] Master FIRST TX sent at uptime: %lld ms (Tick: %u)", 
-                (long long)uptime_ms, start_tick);
-		#endif
-    }
-}
-
-void log_slave_first_tx(uint32_t start_tick)
-{
-    if (!slave_first_tx_logged) {
-        slave_first_tx_logged = true;
-        int64_t uptime_ms = k_uptime_get();
-		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
-        LOG_INF("[TIMING] Slave FIRST TX (Reply) sent at uptime: %lld ms (Tick: %u)", 
-                (long long)uptime_ms, start_tick);
-		#endif
-    }
-}
-
-#define MAX_ACQ_SAMPLES 5
-
-/* Puffer für die Akquisitions-Offsets */
-static int64_t acq_offsets[MAX_ACQ_SAMPLES];
-static uint8_t acq_sample_count = 0;
-
-/* Payload-Struktur für das allererste TX-Paket */
-struct __attribute__((packed)) first_tx_payload {
-    uint8_t count;                       /* Anzahl gespeicherter Offsets */
-    int64_t offsets[MAX_ACQ_SAMPLES];    /* Die Offsets der Pakete 0, 1, 2... */
-    int64_t final_grid_offset;           /* Der letztlich für das Grid genutzte Offset */
-};
-
-// Ende Sync-Logik
-
-//Histogramm für die Übertragungszeit der Frames
-static uint64_t frame_transmission_time;
-static int64_t delay_ticks; 
-static uint64_t peer_tx_start;
-
-/* ========================================================================= */
-/* START: HOCHPRÄZISES ADAPTIVES HISTOGRAMM                                  */
-/* ========================================================================= */
-
-#define HIST_NUM_BINS         20LL      
-#define HIST_INITIAL_MIN_NS   1440000LL /* Start: 1.440 ms */
-#define HIST_INITIAL_MAX_NS   1448000LL /* Start: 1.448 ms */
-#define HIST_PADDING_NS       500LL     /* 0.5 µs Sicherheitsabstand links/rechts */
-
-struct latency_histogram {
-    uint32_t bins[HIST_NUM_BINS];
-    uint32_t underflow;
-    uint32_t overflow;
-    uint32_t total_samples;
-    int64_t min_measured_ns;
-    int64_t max_measured_ns;
-    int64_t sum_ns;
-
-    int64_t current_min_ns;
-    int64_t current_max_ns;
-    int64_t current_bin_width_ns;
-};
-
-static struct latency_histogram hist = {
-    .min_measured_ns = INT64_MAX,
-    .max_measured_ns = INT64_MIN,
-    .current_min_ns = HIST_INITIAL_MIN_NS,
-    .current_max_ns = HIST_INITIAL_MAX_NS,
-    .current_bin_width_ns = (HIST_INITIAL_MAX_NS - HIST_INITIAL_MIN_NS) / HIST_NUM_BINS
-};
-
-/* ========================================================================= */
-/* ENDE: HOCHPRÄZISES ADAPTIVES HISTOGRAMM                                    */
-/* ========================================================================= */
-
-/**
- * @brief Sortiert eine gemessene Latenz (in ns) dynamisch in das Histogramm ein.
- * @param delay_ns Gemessener Delay / Übertragungszeit in Nanosekunden
- */
-static void histogram_add_sample(int64_t delay_ns)
-{
-    /* Plausibilitätsfilter: Ungültige Werte / Boot-Ausreißer ignorieren */
-    if (delay_ns < 0LL || delay_ns > 10000000LL) {
-        return;
-    }
-
-    hist.total_samples++;
-    hist.sum_ns += delay_ns;
-
-    if (delay_ns < hist.min_measured_ns) hist.min_measured_ns = delay_ns;
-    if (delay_ns > hist.max_measured_ns) hist.max_measured_ns = delay_ns;
-
-    if (delay_ns < hist.current_min_ns) {
-        hist.underflow++;
-        return;
-    }
-    if (delay_ns >= hist.current_max_ns) {
-        hist.overflow++;
-        return;
-    }
-
-    int bin_idx = (int)((delay_ns - hist.current_min_ns) / hist.current_bin_width_ns);
-    if (bin_idx >= HIST_NUM_BINS) {
-        bin_idx = HIST_NUM_BINS - 1;
-    }
-
-    hist.bins[bin_idx]++;
-}
-
-/**
- * @brief Hilfsfunktion zur Formatierung von Nanosekunden als Millisekunden (z.B. 1.444 ms)
- */
-static void log_format_ns_as_ms(const char *prefix, int64_t ns_val, const char *suffix)
-{
-    int64_t ms_int = ns_val / 1000000LL;
-    int64_t ms_frac = (ns_val % 1000000LL) / 1000LL; /* Auf Mikrosekunden/3 Nachkommastellen runden */
-    if (ms_frac < 0) ms_frac = -ms_frac;
-
-    LOG_INF("%s%lld.%03lld ms%s", prefix, ms_int, ms_frac, suffix);
-}
-
-/**
- * @brief Gibt das Histogramm in Millisekunden übersichtlich im Log aus.
- */
-static void histogram_print_and_reset(void)
-{
-    if (hist.total_samples == 0) {
-        LOG_INF("[HISTOGRAM] Keine gültigen Samples vorhanden.");
-        return;
-    }
-
-    int64_t mean_ns = hist.sum_ns / (int64_t)hist.total_samples;
-
-    int64_t min_ms_int = hist.min_measured_ns / 1000000LL;
-    int64_t min_ms_frac = (hist.min_measured_ns % 1000000LL) / 1000LL;
-    
-    int64_t max_ms_int = hist.max_measured_ns / 1000000LL;
-    int64_t max_ms_frac = (hist.max_measured_ns % 1000000LL) / 1000LL;
-
-    int64_t mean_ms_int = mean_ns / 1000000LL;
-    int64_t mean_ms_frac = (mean_ns % 1000000LL) / 1000LL;
-
-    LOG_INF("================ ADAPTIVE UPLINK HISTOGRAM ================");
-    LOG_INF(" Samples: %u | Min: %lld.%03lld ms | Max: %lld.%03lld ms | Mean: %lld.%03lld ms",
-            hist.total_samples, 
-            min_ms_int, min_ms_frac,
-            max_ms_int, max_ms_frac,
-            mean_ms_int, mean_ms_frac);
-    
-    LOG_INF(" Bin Width: %lld ns | Active Span: %lld ns", 
-            (long long)hist.current_bin_width_ns, 
-            (long long)(hist.current_max_ns - hist.current_min_ns));
-    LOG_INF(" ---------------------------------------------------------------");
-    
-    if (hist.underflow > 0) {
-        LOG_INF("   < %lld.%03lld us : %u samples (UNDERFLOW)", 
-                hist.current_min_ns / 1000LL, hist.current_min_ns % 1000LL, hist.underflow);
-    }
-
-    for (int i = 0; i < HIST_NUM_BINS; i++) {
-        int64_t bin_start_ns = hist.current_min_ns + (i * hist.current_bin_width_ns);
-        int64_t bin_end_ns = bin_start_ns + hist.current_bin_width_ns;
-
-        LOG_INF("   [%4lld.%03lld - %4lld.%03lld us] : %u", 
-                bin_start_ns / 1000LL, bin_start_ns % 1000LL,
-                bin_end_ns / 1000LL, bin_end_ns % 1000LL,
-                hist.bins[i]);
-    }
-
-    if (hist.overflow > 0) {
-        LOG_INF("   >= %lld.%03lld us : %u samples (OVERFLOW)", 
-                hist.current_max_ns / 1000LL, hist.current_max_ns % 1000LL, hist.overflow);
-    }
-    LOG_INF("===============================================================");
-
-    /* ===================================================================== */
-    /* FEINES ZOOMEINSTELLEN FÜR DEN NÄCHSTEN DURCHLAUF                       */
-    /* ===================================================================== */
-    if (hist.min_measured_ns != INT64_MAX && hist.max_measured_ns != INT64_MIN) {
-        /* Sehr enges Padding (500 ns) um die gemessenen Grenzen */
-        hist.current_min_ns = hist.min_measured_ns - HIST_PADDING_NS;
-        hist.current_max_ns = hist.max_measured_ns + HIST_PADDING_NS;
-
-        /* Mindestfenster von 1 µs (1000 ns) halten, damit Bin-Breite >= 50 ns bleibt */
-        if (hist.current_max_ns - hist.current_min_ns < 1000LL) {
-            hist.current_max_ns = hist.current_min_ns + 1000LL;
-        }
-
-        hist.current_bin_width_ns = (hist.current_max_ns - hist.current_min_ns) / HIST_NUM_BINS;
-    }
-
-    memset(hist.bins, 0, sizeof(hist.bins));
-    hist.underflow = 0;
-    hist.overflow = 0;
-    hist.total_samples = 0;
-    hist.sum_ns = 0;
-    hist.min_measured_ns = INT64_MAX;
-    hist.max_measured_ns = INT64_MIN;
-}
 
 BUILD_ASSERT(CONFIG_CARRIER, "Carrier must be configured according to local regulations");
 
@@ -541,6 +250,280 @@ BUILD_ASSERT(TX_LEAD_TICKS >= MEASURED_RX_ACTIVE_TO_IDLE + MEASURED_TX_IDLE_TO_A
 /* A literal so it can size an array; asserted against the struct below. */
 #define APP_BYTES 30
 #define DECT_MAX_ETH_BYTES (TBS_BYTES - APP_BYTES)
+
+
+/* ========================================================================= */
+// new code
+/* ========================================================================= */
+
+/* 1 Mikrosekunde in 69.12 MHz Modem-Ticks */
+#define MAX_ALLOWED_DESYNC_TICKS   59LL //69LL  /* ~1.000 ns */
+
+/* Button 1 (sw0) aus dem Devicetree des DK-Boards holen */
+#define SW0_NODE DT_ALIAS(sw0)
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+
+/* Globales Flag für die Sende-Sperre */
+static volatile bool tx_suppressed = false;
+static struct gpio_callback button_cb_data;
+
+/**
+ * @brief Interrupt-Handler: Schaltet die Sende-Sperre bei JEDEM Tastendruck um (Toggle)
+ */
+static void button1_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    static int64_t last_press_time = 0;
+    int64_t now = k_uptime_get();
+
+    /* Entprellung (Debounce): Tappendrücke innerhalb von 250 ms ignorieren */
+    if (now - last_press_time < 250) {
+        return;
+    }
+    last_press_time = now;
+
+    /* Zustand der Sendesperre umkehren (Toggle) */
+    tx_suppressed = !tx_suppressed;
+
+    if (tx_suppressed) {
+        LOG_WRN("[TEST] Button 1 GEDRÜCKT -> Senden UNTERBROCHEN (Schalter: AUS)");
+    } else {
+        LOG_INF("[TEST] Button 1 GEDRÜCKT -> Senden WIEDERAUFGENOMMEN (Schalter: EIN)");
+    }
+}
+
+/**
+ * @brief Initialisiert Button 1 mit Interrupt NUR auf der steigenden Flanke (Drücken)
+ */
+void init_test_button(void)
+{
+    int ret;
+
+    if (!gpio_is_ready_dt(&button1)) {
+        LOG_ERR("Error: GPIO Button device not ready");
+        return;
+    }
+
+    ret = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+    if (ret < 0) {
+        LOG_ERR("Error %d: failed to configure button pin", ret);
+        return;
+    }
+
+    /* WICHTIG: Ändern auf GPIO_INT_EDGE_TO_ACTIVE (NUR beim Drücken auslösen, nicht beim Loslassen!) */
+    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
+    if (ret < 0) {
+        LOG_ERR("Error %d: failed to configure interrupt on button pin", ret);
+        return;
+    }
+
+    gpio_init_callback(&button_cb_data, button1_pressed_callback, BIT(button1.pin));
+    gpio_add_callback(button1.port, &button_cb_data);
+    LOG_INF("Button 1 Toggle-Modus (TX On/Off) erfolgreich initialisiert.");
+}
+
+/* Drift-Messung über ein Block-Fenster */
+#define SKEW_CALC_INTERVAL_CYCLES  900u  /* Alle 300 Zyklen (~1 Sekunde) den Skew neu berechnen */
+
+/* Prädiktive Skew-Kompensation für den Freilauf */
+static int64_t learned_skew_ppb = 0;   /* Gelernte Drift in Parts per Billion */
+static int64_t skew_anchor_offset = 0;
+static uint32_t skew_anchor_cycle = 0;
+static bool skew_anchor_valid = false;
+static bool skew_valid = false;
+
+/* Trackt den letzten Zyklus, für den der Skew bereits aufaddiert/kompensiert wurde */
+static uint32_t last_compensated_cycle = 0;
+
+/* Speicher für den gebrochenen Rest (Remainder) in PPB-Ticks */
+static int64_t skew_remainder_ppb_ticks = 0;
+
+// erste Master/Slave Nachricht gesendet empfangen
+static bool master_first_tx_logged = false;
+static bool master_first_rx_logged = false;
+static bool slave_first_rx_logged = false;
+static bool slave_first_tx_logged = false;
+
+void log_master_first_tx(uint32_t start_tick)
+{
+    if (!master_first_tx_logged) {
+        master_first_tx_logged = true;
+        int64_t uptime_ms = k_uptime_get();
+		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
+        LOG_INF("[TIMING] Master FIRST TX sent at uptime: %lld ms (Tick: %u)", 
+                (long long)uptime_ms, start_tick);
+		#endif
+    }
+}
+
+void log_slave_first_tx(uint32_t start_tick)
+{
+    if (!slave_first_tx_logged) {
+        slave_first_tx_logged = true;
+        int64_t uptime_ms = k_uptime_get();
+		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
+        LOG_INF("[TIMING] Slave FIRST TX (Reply) sent at uptime: %lld ms (Tick: %u)", 
+                (long long)uptime_ms, start_tick);
+		#endif
+    }
+}
+
+#define MAX_ACQ_SAMPLES 5
+
+/* Puffer für die Akquisitions-Offsets */
+static int64_t acq_offsets[MAX_ACQ_SAMPLES];
+static uint8_t acq_sample_count = 0;
+
+/* Payload-Struktur für das allererste TX-Paket */
+struct __attribute__((packed)) first_tx_payload {
+    uint8_t count;                       /* Anzahl gespeicherter Offsets */
+    int64_t offsets[MAX_ACQ_SAMPLES];    /* Die Offsets der Pakete 0, 1, 2... */
+    int64_t final_grid_offset;           /* Der letztlich für das Grid genutzte Offset */
+};
+
+// Ende Sync-Logik
+
+//Histogramm für die Übertragungszeit der Frames
+static uint64_t frame_transmission_time;
+static int64_t delay_ticks; 
+static uint64_t peer_tx_start;
+
+/* ========================================================================= */
+/*  HISTOGRAMM                                                               */
+/* ========================================================================= */
+
+#define HIST_NUM_BINS         10LL      
+#define HIST_INITIAL_MIN_NS   1000000LL /* Start: 1.000.000 ns */
+#define HIST_INITIAL_MAX_NS   2000000LL /* Start: 2.000.000 ns */
+
+struct latency_histogram {
+    uint32_t bins[HIST_NUM_BINS];
+    uint32_t underflow;
+    uint32_t overflow;
+    uint32_t total_samples;
+    int64_t min_measured_ns;
+    int64_t max_measured_ns;
+    int64_t sum_ns;
+
+    int64_t current_min_ns;
+    int64_t current_max_ns;
+    int64_t current_bin_width_ns;
+};
+
+static struct latency_histogram hist = {
+    .min_measured_ns = INT64_MAX,
+    .max_measured_ns = INT64_MIN,
+    .current_min_ns = HIST_INITIAL_MIN_NS,
+    .current_max_ns = HIST_INITIAL_MAX_NS,
+    .current_bin_width_ns = (HIST_INITIAL_MAX_NS - HIST_INITIAL_MIN_NS) / HIST_NUM_BINS
+};
+
+/* ========================================================================= */
+/*  HISTOGRAMM                                                               */
+/* ========================================================================= */
+
+/**
+ * @brief Sortiert eine gemessene Latenz (in ns) dynamisch in das Histogramm ein.
+ * @param delay_ns Gemessener Delay / Übertragungszeit in Nanosekunden
+ */
+static void histogram_add_sample(int64_t delay_ns)
+{
+    /* Plausibilitätsfilter: Ungültige Werte / Boot-Ausreißer ignorieren */
+    if (delay_ns < 0LL || delay_ns > 10000000LL) {
+        return;
+    }
+
+    hist.total_samples++;
+    hist.sum_ns += delay_ns;
+
+    if (delay_ns < hist.min_measured_ns) hist.min_measured_ns = delay_ns;
+    if (delay_ns > hist.max_measured_ns) hist.max_measured_ns = delay_ns;
+
+    if (delay_ns < hist.current_min_ns) {
+        hist.underflow++;
+        return;
+    }
+    if (delay_ns >= hist.current_max_ns) {
+        hist.overflow++;
+        return;
+    }
+
+    int bin_idx = (int)((delay_ns - hist.current_min_ns) / hist.current_bin_width_ns);
+    if (bin_idx >= HIST_NUM_BINS) {
+        bin_idx = HIST_NUM_BINS - 1;
+    }
+
+    hist.bins[bin_idx]++;
+}
+
+/**
+ * @brief Gibt das Histogramm vollständig in Nanosekunden im Log aus.
+ */
+static void histogram_print_and_reset(void)
+{
+    if (hist.total_samples == 0) {
+        LOG_INF("[HISTOGRAM] Keine gültigen Samples vorhanden.");
+        return;
+    }
+
+    int64_t mean_ns = hist.sum_ns / (int64_t)hist.total_samples;
+
+    LOG_INF("================ HISTOGRAM (%s) ================", ROLE_NAME);
+    LOG_INF(" Samples: %u | Min: %lld ns | Max: %lld ns | Mean: %lld ns", 
+        	hist.total_samples, 
+            (long long)hist.min_measured_ns, 
+            (long long)hist.max_measured_ns, 
+            (long long)mean_ns);
+    
+    LOG_INF(" Bin Width: %lld ns | Active Span: %lld ns", 
+            (long long)hist.current_bin_width_ns, 
+            (long long)(hist.current_max_ns - hist.current_min_ns));
+    LOG_INF(" ---------------------------------------------------------------");
+    
+    if (hist.underflow > 0) {
+        LOG_INF("   < %lld ns : %u samples (UNDERFLOW)", 
+                (long long)hist.current_min_ns, hist.underflow);
+    }
+
+    for (int i = 0; i < HIST_NUM_BINS; i++) {
+        int64_t bin_start_ns = hist.current_min_ns + (i * hist.current_bin_width_ns);
+        int64_t bin_end_ns = bin_start_ns + hist.current_bin_width_ns;
+
+        LOG_INF("   [%8lld - %8lld ns] : %u", 
+                (long long)bin_start_ns,
+                (long long)bin_end_ns,
+                hist.bins[i]);
+    }
+
+    if (hist.overflow > 0) {
+        LOG_INF("   >= %lld ns : %u samples (OVERFLOW)", 
+                (long long)hist.current_max_ns, hist.overflow);
+    }
+    LOG_INF("===============================================================");
+
+    /* Auto-Zoom für den nächsten Durchlauf */
+	if (hist.min_measured_ns != INT64_MAX && hist.max_measured_ns != INT64_MIN) {
+        int64_t data_span_ns = hist.max_measured_ns - hist.min_measured_ns;
+
+        /* Dynamisches Padding: 50% der Gemessenen Spanne (data_span_ns / 2) */
+        int64_t dynamic_padding_ns = data_span_ns / 2LL;
+
+        hist.current_min_ns = hist.min_measured_ns - dynamic_padding_ns;
+        hist.current_max_ns = hist.max_measured_ns + dynamic_padding_ns;
+		hist.current_bin_width_ns = (hist.current_max_ns - hist.current_min_ns) / HIST_NUM_BINS;
+	}
+
+    memset(hist.bins, 0, sizeof(hist.bins));
+    hist.underflow = 0;
+    hist.overflow = 0;
+    hist.total_samples = 0;
+    hist.sum_ns = 0;
+    hist.min_measured_ns = INT64_MAX;
+    hist.max_measured_ns = INT64_MIN;
+}
+
+/* ========================================================================= */
+// end new code
+/* ========================================================================= */
 
 /* One transport block. There is no separate link header: the link is a fixed
  * 1-master/1-slave pair, and integrity is left to the DECT PHY's own CRC (a
@@ -1163,7 +1146,7 @@ static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 					/* Exponentielle Glättung über die Blöcke */
 					learned_skew_ppb = (learned_skew_ppb * 7 + calculated_skew_ppb) / 8;
 				}
-				#if IS_ENABLED(CONFIG_ENABLE_SKEW_LOGGING)
+				#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
 				LOG_INF("[SKEW UPDATE] Calculated over %u cycles: delta %lld ticks -> learned_skew: %lld ppb",
 				        elapsed_cycles, delta_offset, (long long)learned_skew_ppb);
 				#endif
@@ -1374,7 +1357,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			#endif
 		}
 
-		delay_ticks = (int64_t)frame_transmission_time - ((int64_t)peer_tx_start + pps_offset); //Histogramm
+		delay_ticks = llabs((int64_t)frame_transmission_time - ((int64_t)peer_tx_start + pps_offset)); //Histogramm
 
 		sync_update(cycle, unwrap_tx_start(tx_start_lo, stf), stf);
 
@@ -1473,6 +1456,9 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			LOG_INF("===========================================================");
 		}
 		#endif
+
+		delay_ticks = llabs((int64_t)frame_transmission_time - ((int64_t)peer_tx_start - slave_offset)); //Histogramm
+
 		k_spin_unlock(&sync_lock, key);
 
 		if (!master_first_rx_logged) {
@@ -1754,7 +1740,7 @@ static void scheduler_thread(void)
 					epoch += drift_ticks;
 					clock_offset += drift_ticks;
 					
-					#if IS_ENABLED(CONFIG_ENABLE_SKEW_LOGGING)
+					#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
 					LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
 							(long long)drift_ticks, next_tx_cycle, (long long)learned_skew_ppb);
 					#endif
