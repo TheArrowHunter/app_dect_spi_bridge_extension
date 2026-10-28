@@ -20,12 +20,13 @@
     status = "okay";
     pinctrl-0 = <&spi2_default>;
     pinctrl-names = "default";
-    def-char = <0xFF>; 
+    def-char = <0xFF>;
 };
 
 / {
     aliases {
         drdy-pin = &drdy_out;
+        sw0 = &button0;
     };
 
     outputs {
@@ -35,5 +36,12 @@
             gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
             label = "Data Ready Output Pin";
         };
+    };
+
+    /* Falls das Board-Target Buttons nicht standardmäßig aktiviert hat,
+    * wird button0 hier explizit auf den P0.08 (oder den DK-spezifischen Pin) gemappt:
+    */
+    &gpio0 {
+        status = "okay";
     };
 };

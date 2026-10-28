@@ -5,6 +5,10 @@
 
 LOG_MODULE_REGISTER(bridge, LOG_LEVEL_INF);
 
+/* In main.c oben einfügen (ohne extra .h Datei): */
+extern void init_test_button(void);
+extern volatile bool tx_suppressed;
+
 /* One pool and queue per direction, see bridge.h. */
 K_MEM_SLAB_DEFINE(bridge_frame_slab_dect_tx, sizeof(struct bridge_frame), FRAME_POOL_COUNT, 4);
 K_MEM_SLAB_DEFINE(bridge_frame_slab_spi_tx, sizeof(struct bridge_frame), FRAME_POOL_COUNT, 4);
@@ -20,10 +24,10 @@ static void report_thread(void)
 	while (1)
 	{
  		k_sleep(K_SECONDS(5));
-/* 		LOG_INF("-----");
+		LOG_INF("-----");
 		dect_log_stats();
 		LOG_INF("-----");
-		spi_bridge_log_stats(); */
+		spi_bridge_log_stats();
 	}
 }
 
@@ -52,6 +56,11 @@ int main(void)
 		LOG_ERR("DECT init failed, err %d", err);
 		return err;
 	}
+
+	#if defined(CONFIG_TDMA_ROLE_MASTER)
+		/* Button auf dem Master initialisieren */
+		init_test_button();
+	#endif
 
 	/* Everything runs in its own threads from here on. */
 	return 0;

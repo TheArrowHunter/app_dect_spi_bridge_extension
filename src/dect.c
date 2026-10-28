@@ -13,6 +13,66 @@
 
 LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
+/* 1 Mikrosekunde in 69.12 MHz Modem-Ticks */
+#define MAX_ALLOWED_DESYNC_TICKS   39LL //69LL  /* ~1.000 ns */
+
+#include <zephyr/drivers/gpio.h>
+
+/* Button 1 (sw0) aus dem Devicetree des DK-Boards holen */
+#define SW0_NODE DT_ALIAS(sw0)
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
+
+/* Globales Flag für die Sende-Sperre */
+static volatile bool tx_suppressed = false;
+static struct gpio_callback button_cb_data;
+
+/**
+ * @brief Interrupt-Handler: Wird aufgerufen, wenn Button 1 gedrückt oder losgelassen wird.
+ */
+static void button1_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+    /* Button ist aktiv-low oder aktiv-high – gpio_pin_get_dt liest den logischen Zustand (1 = gedrückt) */
+    int val = gpio_pin_get_dt(&button1);
+
+    if (val > 0) {
+        tx_suppressed = true;
+        LOG_WRN("[TEST] Button 1 GEDRÜCKT -> Senden UNTERBROCHEN!");
+    } else {
+        tx_suppressed = false;
+        LOG_INF("[TEST] Button 1 LOSGELASSEN -> Senden WIEDERAUFGENOMMEN.");
+    }
+}
+
+/**
+ * @brief Initalisiert Button 1 mit Interrupts auf beiden Flanken (Press & Release)
+ */
+void init_test_button(void)
+{
+    int ret;
+
+    if (!gpio_is_ready_dt(&button1)) {
+        LOG_ERR("Error: GPIO Button device not ready");
+        return;
+    }
+
+    ret = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+    if (ret < 0) {
+        LOG_ERR("Error %d: failed to configure button pin", ret);
+        return;
+    }
+
+    /* Trigger auf BEIDE Flanken (Drücken und Loslassen) setzen */
+    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_BOTH);
+    if (ret < 0) {
+        LOG_ERR("Error %d: failed to configure interrupt on button pin", ret);
+        return;
+    }
+
+    gpio_init_callback(&button_cb_data, button1_pressed_callback, BIT(button1.pin));
+    gpio_add_callback(button1.port, &button_cb_data);
+    LOG_INF("Button 1 (TX-Interrupt Test) erfolgreich initialisiert.");
+}
+
 // erste Master/Slave Nachricht gesendet empfangen
 static bool master_first_tx_logged = false;
 static bool master_first_rx_logged = false;
@@ -854,6 +914,16 @@ static uint16_t build_tx_pdu(struct dect_pdu *pdu, uint32_t cycle, uint64_t star
 
 static void schedule_tx(uint32_t cycle)
 {
+	/* Wenn Button 1 gedrückt ist, brechen wir das Senden hier einfach ab! */
+    if (tx_suppressed) {
+        /* Optional: Zähler hochzählen oder Log zur Kontrolle */
+        static uint32_t skip_cnt = 0;
+        if (skip_cnt++ % 300 == 0) { /* Alle ~1s ein Log, um RTT nicht zu fluten */
+            LOG_WRN("Master TX paused (Button 1 held down)...");
+        }
+        return; /* PAKET NICHT AN DEN PHY GEBEN -> Funkpause! */
+    }
+
 	uint64_t start = (uint64_t)((int64_t)cycle_base(cycle) + MY_TX_OFFSET);
 	struct dect_pdu *pdu = &tx_pdu[cycle % ARRAY_SIZE(tx_pdu)];
 	uint16_t eth_len;
@@ -1193,6 +1263,23 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		k_spinlock_key_t key = k_spin_lock(&sync_lock);
 
 		first = !sync_valid;
+
+		/* 1. Berechne den rohen Phasensprung / Fehler für dieses Paket */
+        int64_t current_raw_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
+        int64_t phase_error_ticks = llabs(current_raw_offset - clock_offset);
+
+        /* 2. Prüfe, ob wir außerhalb des 1 µs Fensters liegen */
+        if (!first && phase_error_ticks > MAX_ALLOWED_DESYNC_TICKS) {
+            LOG_WRN("[SYNC LOSS] Phase Drift > 1us detected: %lld ticks (%lld ns)! Re-synchronizing...",
+                    (long long)phase_error_ticks, 
+                    (long long)ticks_to_ns(phase_error_ticks));
+            
+            /* Synchronisation als ungültig markieren & State zurücksetzen */
+            sync_valid = false;
+            state = STATE_ACQUIRING;
+            acq_sample_count = 0; /* Reset für Kaltstart-Messung */
+        }
+
 		k_spin_unlock(&sync_lock, key);
 
 		//speichere erste Offsets für die spätere Auswertung um die Synchronisation zu überprüfen
@@ -1310,8 +1397,8 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		if (!master_first_rx_logged) {
 			master_first_rx_logged = true;
 			int64_t uptime_ms = k_uptime_get();
-			LOG_INF("[TIMING] Master FIRST RX received from Slave at uptime: %lld ms (STF: %u)", 
-					(long long)uptime_ms, stf);
+			LOG_INF("[TIMING] Master FIRST RX received from Slave at uptime: %lld ms (STF: %llu)", 
+					(long long)uptime_ms, (unsigned long long)stf);
 		}
 		
 		// Überprüfung: Wurde der Block von 5000 Samples erreicht?
@@ -1376,17 +1463,17 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		}
 	}
 
-	/* In Nanosekunden umrechnen und in das Histogramm einsortieren */
+/* 	// In Nanosekunden umrechnen und in das Histogramm einsortieren
     int64_t delay_ns = ticks_to_ns(delay_ticks);
     histogram_add_sample(delay_ns);
 
-    /* Alle 1000 Pakete (~3,3 Sekunden) das Histogramm im Terminal ausgeben */
+    // Alle 1000 Pakete (~3,3 Sekunden) das Histogramm im Terminal ausgeben
     static uint32_t sample_counter = 0;
     sample_counter++;
     if (sample_counter >= 1000) {
         histogram_print_and_reset();
         sample_counter = 0;
-    }
+    } */
 }
 
 static void on_pcc_crc_err(const struct nrf_modem_dect_phy_pcc_crc_failure_event *evt)
