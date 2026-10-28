@@ -13,8 +13,23 @@
 
 LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
+// Bestimmtes Logging an- und ausschalten, um die Latenz zu messen. Nur für Testzwecke!
+// 1 = aktiv 0 = deaktiviert
+
+#define CONFIG_ENABLE_COASTING_TIMEOUT 0
+
+#define CONFIG_ENABLE_SKEW_LOGGING 0
+
+#define CONFIG_ENABLE_HISTOGRAM_LOGGING 0
+
+#define CONFIG_ENABLE_FIRST_TX_RX_LOGGING 0
+
+#define CONFIG_ENABLE_COLDSTART_LOGGING 0
+
+#define CONFIG_ENABLE_MASTER_CLOCK_SKEW_LOGGING 0
+
 /* 1 Mikrosekunde in 69.12 MHz Modem-Ticks */
-#define MAX_ALLOWED_DESYNC_TICKS   39LL //69LL  /* ~1.000 ns */
+#define MAX_ALLOWED_DESYNC_TICKS   59LL //69LL  /* ~1.000 ns */
 
 #include <zephyr/drivers/gpio.h>
 
@@ -27,24 +42,31 @@ static volatile bool tx_suppressed = false;
 static struct gpio_callback button_cb_data;
 
 /**
- * @brief Interrupt-Handler: Wird aufgerufen, wenn Button 1 gedrückt oder losgelassen wird.
+ * @brief Interrupt-Handler: Schaltet die Sende-Sperre bei JEDEM Tastendruck um (Toggle)
  */
 static void button1_pressed_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    /* Button ist aktiv-low oder aktiv-high – gpio_pin_get_dt liest den logischen Zustand (1 = gedrückt) */
-    int val = gpio_pin_get_dt(&button1);
+    static int64_t last_press_time = 0;
+    int64_t now = k_uptime_get();
 
-    if (val > 0) {
-        tx_suppressed = true;
-        LOG_WRN("[TEST] Button 1 GEDRÜCKT -> Senden UNTERBROCHEN!");
+    /* Entprellung (Debounce): Tappendrücke innerhalb von 250 ms ignorieren */
+    if (now - last_press_time < 250) {
+        return;
+    }
+    last_press_time = now;
+
+    /* Zustand der Sendesperre umkehren (Toggle) */
+    tx_suppressed = !tx_suppressed;
+
+    if (tx_suppressed) {
+        LOG_WRN("[TEST] Button 1 GEDRÜCKT -> Senden UNTERBROCHEN (Schalter: AUS)");
     } else {
-        tx_suppressed = false;
-        LOG_INF("[TEST] Button 1 LOSGELASSEN -> Senden WIEDERAUFGENOMMEN.");
+        LOG_INF("[TEST] Button 1 GEDRÜCKT -> Senden WIEDERAUFGENOMMEN (Schalter: EIN)");
     }
 }
 
 /**
- * @brief Initalisiert Button 1 mit Interrupts auf beiden Flanken (Press & Release)
+ * @brief Initialisiert Button 1 mit Interrupt NUR auf der steigenden Flanke (Drücken)
  */
 void init_test_button(void)
 {
@@ -61,8 +83,8 @@ void init_test_button(void)
         return;
     }
 
-    /* Trigger auf BEIDE Flanken (Drücken und Loslassen) setzen */
-    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_BOTH);
+    /* WICHTIG: Ändern auf GPIO_INT_EDGE_TO_ACTIVE (NUR beim Drücken auslösen, nicht beim Loslassen!) */
+    ret = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_TO_ACTIVE);
     if (ret < 0) {
         LOG_ERR("Error %d: failed to configure interrupt on button pin", ret);
         return;
@@ -70,8 +92,24 @@ void init_test_button(void)
 
     gpio_init_callback(&button_cb_data, button1_pressed_callback, BIT(button1.pin));
     gpio_add_callback(button1.port, &button_cb_data);
-    LOG_INF("Button 1 (TX-Interrupt Test) erfolgreich initialisiert.");
+    LOG_INF("Button 1 Toggle-Modus (TX On/Off) erfolgreich initialisiert.");
 }
+
+/* Drift-Messung über ein Block-Fenster */
+#define SKEW_CALC_INTERVAL_CYCLES  900u  /* Alle 300 Zyklen (~1 Sekunde) den Skew neu berechnen */
+
+/* Prädiktive Skew-Kompensation für den Freilauf */
+static int64_t learned_skew_ppb = 0;   /* Gelernte Drift in Parts per Billion */
+static int64_t skew_anchor_offset = 0;
+static uint32_t skew_anchor_cycle = 0;
+static bool skew_anchor_valid = false;
+static bool skew_valid = false;
+
+/* Trackt den letzten Zyklus, für den der Skew bereits aufaddiert/kompensiert wurde */
+static uint32_t last_compensated_cycle = 0;
+
+/* Speicher für den gebrochenen Rest (Remainder) in PPB-Ticks */
+static int64_t skew_remainder_ppb_ticks = 0;
 
 // erste Master/Slave Nachricht gesendet empfangen
 static bool master_first_tx_logged = false;
@@ -84,8 +122,10 @@ void log_master_first_tx(uint32_t start_tick)
     if (!master_first_tx_logged) {
         master_first_tx_logged = true;
         int64_t uptime_ms = k_uptime_get();
+		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
         LOG_INF("[TIMING] Master FIRST TX sent at uptime: %lld ms (Tick: %u)", 
                 (long long)uptime_ms, start_tick);
+		#endif
     }
 }
 
@@ -94,8 +134,10 @@ void log_slave_first_tx(uint32_t start_tick)
     if (!slave_first_tx_logged) {
         slave_first_tx_logged = true;
         int64_t uptime_ms = k_uptime_get();
+		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
         LOG_INF("[TIMING] Slave FIRST TX (Reply) sent at uptime: %lld ms (Tick: %u)", 
                 (long long)uptime_ms, start_tick);
+		#endif
     }
 }
 
@@ -1098,6 +1140,39 @@ static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 			return;
 		}
 
+		/* --- NEU: Skew über ein Fenster von z.B. 300 Zyklen (1 Sekunde) berechnen --- */
+		if (!skew_anchor_valid) {
+			skew_anchor_offset = offset;
+			skew_anchor_cycle = cycle;
+			skew_anchor_valid = true;
+		} else {
+			uint32_t elapsed_cycles = cycle - skew_anchor_cycle;
+
+			/* Erst nach ausreichend vielen Zyklen den Drift berechnen */
+			if (elapsed_cycles >= SKEW_CALC_INTERVAL_CYCLES) {
+				int64_t delta_offset = offset - skew_anchor_offset;
+				int64_t elapsed_ticks = (int64_t)elapsed_cycles * (int64_t)CYCLE;
+
+				/* Drift in PPB berechnen: (delta_ticks * 1e9) / total_ticks */
+				int64_t calculated_skew_ppb = (delta_offset * 1000000000LL) / elapsed_ticks;
+
+				if (!skew_valid) {
+					learned_skew_ppb = calculated_skew_ppb;
+					skew_valid = true;
+				} else {
+					/* Exponentielle Glättung über die Blöcke */
+					learned_skew_ppb = (learned_skew_ppb * 7 + calculated_skew_ppb) / 8;
+				}
+				#if IS_ENABLED(CONFIG_ENABLE_SKEW_LOGGING)
+				LOG_INF("[SKEW UPDATE] Calculated over %u cycles: delta %lld ticks -> learned_skew: %lld ppb",
+				        elapsed_cycles, delta_offset, (long long)learned_skew_ppb);
+				#endif
+				/* Ankerpunkt für den nächsten Block neu setzen */
+				skew_anchor_offset = offset;
+				skew_anchor_cycle = cycle;
+			}
+		}
+
 		/* The residual is the error of the previous prediction and is
 		 * the sync-quality measurement reported in dect_log_stats().
 		 */
@@ -1115,7 +1190,14 @@ static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 
 	epoch = new_epoch;
 	clock_offset = offset;
-	last_sync_cycle = cycle;
+
+	/* BEIDE TRACKER ZURÜCKSETZEN: */
+    last_sync_cycle = cycle;         /* Unverändert: Für Statistiken, dect_log_stats() & MAX_COAST_CYCLES */
+    last_compensated_cycle = cycle;  /* Neu: Für das schrittweise Aufaddieren im Freilauf */
+	
+	/* reset bei neuem Hardware-RX */
+	skew_remainder_ppb_ticks = 0;
+
 	sync_valid = true;
 	k_spin_unlock(&sync_lock, key);
 }
@@ -1286,8 +1368,10 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		if (state == STATE_ACQUIRING && acq_sample_count < MAX_ACQ_SAMPLES) {
 			int64_t raw_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
 			acq_offsets[acq_sample_count++] = raw_offset;
+			#if IS_ENABLED(CONFIG_ENABLE_COLDSTART_LOGGING)
 			LOG_INF("[ACQ DATA] Sample #%u Offset: %lld ticks", 
 			        acq_sample_count - 1, (long long)raw_offset);
+			#endif
 		}
 
 		delay_ticks = (int64_t)frame_transmission_time - ((int64_t)peer_tx_start + pps_offset); //Histogramm
@@ -1302,27 +1386,22 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			memcpy(&pps_phase_ticks, pdu->eth, sizeof(pps_phase_ticks));
 			pps_phase_valid = true;
 		}
-		static uint32_t message_nr;
 		if (first)
 		{
 			LOG_INF("locked on master cycle %u, offset %lld ticks",
 					cycle, (long long)clock_offset);
 			k_sem_give(&tick_sem);
-			message_nr = 0;
 		}
-
+		
 		if (!slave_first_rx_logged) {
 			slave_first_rx_logged = true;
 			int64_t uptime_ms = k_uptime_get();
+			#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
 			LOG_INF("[TIMING] Slave FIRST RX (Master Beacon) at uptime: %lld ms (STF: %u)", 
 					(long long)uptime_ms, stf);
+			#endif		
 		}
-
-		if (message_nr < 50) {
-			LOG_INF("Slave: Message NR %lld",
-					message_nr);
-			message_nr++;
-		}
+		
 	}
 #else
 	{
@@ -1349,7 +1428,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		/* Master berechnet seinen eigenen Offset für diesen Zyklus */
 		int64_t master_offset = (int64_t)stf - (int64_t)unwrap_tx_start(tx_start_lo, stf);
 
-		/* Die Magie: Durch die Addition löscht sich der Clock Drift (+theta und -theta) komplett aus! */
+		/* Durch die Addition löscht sich der Clock Drift (+theta und -theta) komplett aus! */
 		int64_t true_two_way_ticks = master_offset + slave_offset;
 		int64_t true_one_way_ticks = true_two_way_ticks / 2;
 
@@ -1365,6 +1444,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		// Round-trip delay end 
 
 		/* Auswertung des ALLERERSTEN Slave-Pakets auf dem Master */
+		#if IS_ENABLED(CONFIG_ENABLE_COLDSTART_LOGGING)
 		if (!master_first_rx_logged) {
 			struct first_tx_payload *acq_data = (struct first_tx_payload *)pdu->eth;
 
@@ -1392,22 +1472,26 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			        (long long)acq_data->final_grid_offset);
 			LOG_INF("===========================================================");
 		}
+		#endif
 		k_spin_unlock(&sync_lock, key);
 
 		if (!master_first_rx_logged) {
 			master_first_rx_logged = true;
 			int64_t uptime_ms = k_uptime_get();
+			#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
 			LOG_INF("[TIMING] Master FIRST RX received from Slave at uptime: %lld ms (STF: %llu)", 
 					(long long)uptime_ms, (unsigned long long)stf);
+			#endif		
 		}
 		
 		// Überprüfung: Wurde der Block von 5000 Samples erreicht?
-/* 		if (sample_count >= 5000)
+		#if IS_ENABLED(CONFIG_ENABLE_MASTER_CLOCK_SKEW_BLOCK_LOGGING)
+		if (sample_count >= 5000)
 		{
 			// Exakter arithmetischer Mittelwert des Blocks
 			int64_t avg_one_way_ns = ns_accumulator / sample_count;
 
-			LOG_INF("Block Avg (5000 samples): one-way delay %lld ns (raw sample: %lld ticks / %lld ns)",
+			LOG_INF("Block Avg (5000 samples): clock skew: %lld ns (raw sample: %lld ticks / %lld ns)",
 					(long long)avg_one_way_ns,
 					(long long)true_one_way_ticks,
 					(long long)true_one_way_ns);
@@ -1415,8 +1499,8 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			// Akkumulator und Zähler für den nächsten 5000er-Block zurücksetzen
 			ns_accumulator = 0;
 			sample_count = 0;
-		} */
-
+		}
+		#endif
 		/* Statischer Zähler für die empfangenen Samples seit dem Kaltstart */
 		static uint32_t startup_samples = 0;
 		static int64_t prev_slave_offset = 0;
@@ -1425,14 +1509,15 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		int64_t clock_skew_ticks = slave_offset - prev_slave_offset;
 		prev_slave_offset = slave_offset;
 
-		/* 3. High-Frequency Logging für die ersten 5 Sekunden (1500 Samples) */
-		if (startup_samples < 50)
+		/* 3. High-Frequency Logging für die ersten 10 Samples */
+		if (startup_samples < 10)
 		{
 			// Ausgabe jedes 10. Samples (~33 ms Raster), um das RTT-Terminal nicht zu überfluten
 //			if (startup_samples % 10 == 0)
 //			{
 				// Umrechnung des Skews in ppb (1 Tick ≈ 14.46 ns bei 69.12 MHz, cycle = 3.33ms)
 				// skew_ticks * 14.468 ns / 0.00333 s ≈ skew_ticks * 4341 ppb
+				#if IS_ENABLED(CONFIG_ENABLE_COLDSTART_LOGGING)
 				LOG_INF("[COLDSTART #%04u] M_Off: %lld t | S_Off: %lld t | OneWay: %lld t | OneWay: %lld ns) | Skew: %lld t",
 						startup_samples,
 						(long long)master_offset,
@@ -1440,6 +1525,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 						(long long)(true_two_way_ticks/2),
 						(long long)ticks_to_ns(true_two_way_ticks / 2),
 						(long long)clock_skew_ticks);
+				#endif
 //			}
 			
 			startup_samples++;
@@ -1463,7 +1549,7 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		}
 	}
 
-/* 	// In Nanosekunden umrechnen und in das Histogramm einsortieren
+	// In Nanosekunden umrechnen und in das Histogramm einsortieren
     int64_t delay_ns = ticks_to_ns(delay_ticks);
     histogram_add_sample(delay_ns);
 
@@ -1471,9 +1557,11 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
     static uint32_t sample_counter = 0;
     sample_counter++;
     if (sample_counter >= 1000) {
+		#if IS_ENABLED(CONFIG_ENABLE_HISTOGRAM_LOGGING)
         histogram_print_and_reset();
+		#endif
         sample_counter = 0;
-    } */
+    }
 }
 
 static void on_pcc_crc_err(const struct nrf_modem_dect_phy_pcc_crc_failure_event *evt)
@@ -1641,6 +1729,42 @@ static void scheduler_thread(void)
 				schedule_rx(next_rx_cycle++);
 			}
 #if defined(CONFIG_TDMA_ROLE_SLAVE)
+			k_spinlock_key_t key = k_spin_lock(&sync_lock);
+			
+			/* 1. Differenz zum letzten bereits kompensierten Zyklus berechnen */
+			uint32_t uncompensated_cycles = next_tx_cycle - last_compensated_cycle;
+
+			if (uncompensated_cycles > 1 && skew_valid) {
+				/* Drift nur für die NEUEN verpassten Zyklen berechnen */
+				uint32_t cycles_to_add = uncompensated_cycles - 1;
+				/* 1. Berechne den genauen Zuwachs an PPB-Ticks für die verpassten Zyklen */
+				int64_t added_ppb_ticks = learned_skew_ppb * (int64_t)CYCLE * (int64_t)cycles_to_add;
+
+				/* 2. Addiere den Zuwachs auf den Akkumulator-Puffer */
+				skew_remainder_ppb_ticks += added_ppb_ticks;
+
+				/* 3. Ermittle, wie viele GANZE Ticks im Puffer stecken (Division durch 1e9) */
+				int64_t drift_ticks = skew_remainder_ppb_ticks / 1000000000LL;
+
+				/* 4. Ziehe die verbuchten ganzen Ticks vom Puffer ab (der Rest bleibt für das nächste Mal) */
+				skew_remainder_ppb_ticks %= 1000000000LL;
+				
+				/* 5. Nur wenn mindestens 1 ganzer Tick aufgelaufen ist, Zeitgitter anpassen */
+				if (drift_ticks != 0) {
+					epoch += drift_ticks;
+					clock_offset += drift_ticks;
+					
+					#if IS_ENABLED(CONFIG_ENABLE_SKEW_LOGGING)
+					LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
+							(long long)drift_ticks, next_tx_cycle, (long long)learned_skew_ppb);
+					#endif
+				}
+
+				last_compensated_cycle = next_tx_cycle - 1;
+			}
+			k_spin_unlock(&sync_lock, key);
+
+			#if IS_ENABLED(CONFIG_ENABLE_COASTING_TIMEOUT)
 			if (cycles_since_sync() > MAX_COAST_CYCLES)
 			{
 				LOG_ERR("sync lost after %u cycles, draining",
@@ -1648,6 +1772,7 @@ static void scheduler_thread(void)
 				k_timer_stop(&tx_timer);
 				state = STATE_DRAINING;
 			}
+			#endif
 #endif
 			break;
 

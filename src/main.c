@@ -5,6 +5,8 @@
 
 LOG_MODULE_REGISTER(bridge, LOG_LEVEL_INF);
 
+#define CONFIG_ENABLE_LOGGING 0
+
 /* In main.c oben einfügen (ohne extra .h Datei): */
 extern void init_test_button(void);
 extern volatile bool tx_suppressed;
@@ -24,10 +26,12 @@ static void report_thread(void)
 	while (1)
 	{
  		k_sleep(K_SECONDS(5));
+		#if IS_ENABLED(CONFIG_ENABLE_LOGGING)
 		LOG_INF("-----");
 		dect_log_stats();
 		LOG_INF("-----");
 		spi_bridge_log_stats();
+		#endif
 	}
 }
 
