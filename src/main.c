@@ -5,7 +5,7 @@
 
 LOG_MODULE_REGISTER(bridge, LOG_LEVEL_INF);
 
-#define CONFIG_ENABLE_LOGGING 0
+#define CONFIG_ENABLE_LOGGING 1
 
 /* In main.c oben einfügen (ohne extra .h Datei): */
 extern void init_test_button(void);

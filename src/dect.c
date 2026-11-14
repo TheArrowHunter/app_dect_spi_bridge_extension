@@ -8,6 +8,12 @@
 #include <nrf_modem_dect_phy.h>
 #include <modem/nrf_modem_lib.h>
 #include <nrf_modem_dect_clock_sync.h>
+#include <nrfx_timer.h>
+#include <nrfx_gpiote.h>
+#include <helpers/nrfx_gppi.h>
+
+// Oszilator und Clock Control für die PPS-Interrupts
+#include <hal/nrf_clock.h>
 
 #include "bridge.h"
 
@@ -22,7 +28,7 @@ LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
 #define CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING 0
 
-#define CONFIG_ENABLE_HISTOGRAM_LOGGING 1
+#define CONFIG_ENABLE_HISTOGRAM_LOGGING 0
 
 #define CONFIG_ENABLE_FIRST_TX_RX_LOGGING 0
 
@@ -46,6 +52,10 @@ BUILD_ASSERT(CONFIG_CARRIER, "Carrier must be configured according to local regu
  * repeats this often.
  */
 #define PPS_PERIOD_TICKS (TICKS_PER_MS * 1000ULL)
+#define PPS_TIMER_FREQUENCY_HZ 16000000UL
+#define PPS_TIMER_PERIOD_TICKS PPS_TIMER_FREQUENCY_HZ
+#define PPS_PULSE_WIDTH_TICKS (PPS_TIMER_FREQUENCY_HZ / 100U)
+#define PPS_CORRELATION_SAMPLES 10U
 
 #define CYCLE_SUBSLOTS 16LL /* 3.333 ms */
 #define CYCLE (CYCLE_SUBSLOTS * SUBSLOT)
@@ -347,8 +357,8 @@ void log_master_first_tx(uint32_t start_tick)
 {
     if (!master_first_tx_logged) {
         master_first_tx_logged = true;
-        int64_t uptime_ms = k_uptime_get();
 		#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
+		int64_t uptime_ms = k_uptime_get();
         LOG_INF("[TIMING] Master FIRST TX sent at uptime: %lld ms (Tick: %u)", 
                 (long long)uptime_ms, start_tick);
 		#endif
@@ -614,6 +624,36 @@ static enum tdma_state state = STATE_ACQUIRING;
 static uint32_t pps_phase_ticks;
 static bool pps_phase_valid;
 
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+#define PPS_NODE DT_PATH(zephyr_user)
+static const struct gpio_dt_spec pps_pin =
+	GPIO_DT_SPEC_GET(PPS_NODE, pps_gpios);
+static nrfx_timer_t pps_timer = NRFX_TIMER_INSTANCE(NRF_TIMER1);
+static nrfx_gpiote_t pps_gpiote = NRFX_GPIOTE_INSTANCE(NRF_GPIOTE);
+static int pps_dppi_channel;
+static bool pps_correlation_active;
+static uint32_t pps_correlation_timer_start;
+static uint32_t pps_correlation_timer_end;
+static uint64_t pps_correlation_modem_time;
+static uint32_t pps_timer_anchor;
+static uint64_t pps_modem_anchor;
+static bool pps_hardware_ready;
+
+static void pps_timer_handler(nrf_timer_event_t event_type, void *p_context)
+{
+	ARG_UNUSED(p_context);
+	if (event_type == NRF_TIMER_EVENT_COMPARE1)
+	{
+		pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] =
+			pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] +
+			PPS_TIMER_PERIOD_TICKS;
+		pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] =
+			pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] +
+			PPS_TIMER_PERIOD_TICKS;
+	}
+}
+#endif
+
 /* Modem ticks -> nanoseconds, truncated to the 32-bit field width of
  * protocol.h. Split into ms and remainder so the multiply cannot overflow.
  * Raw modem-clock time, used only as ns_since_pps()'s fallback before the PPS
@@ -749,6 +789,9 @@ K_SEM_DEFINE(tick_sem, 0, 1);  /* something completed, re-evaluate */
 #if defined(CONFIG_TDMA_ROLE_MASTER)
 K_SEM_DEFINE(clock_sync_sem, 0, 1);
 #endif
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+K_SEM_DEFINE(pps_corr_sem, 0, 1); // reevaluate PPS correlation
+#endif
 
 static void submit_rx(uint32_t handle, uint64_t start, uint64_t duration);
 
@@ -785,7 +828,7 @@ static void on_activate(const struct nrf_modem_dect_phy_activate_event *evt)
 	k_sem_give(&operation_sem);
 }
 
-static void on_time_get(const struct nrf_modem_dect_phy_time_get_event *evt)
+static void on_time_get(const struct nrf_modem_dect_phy_time_get_event *evt, uint64_t event_time)
 {
 	if (evt->err)
 	{
@@ -793,8 +836,271 @@ static void on_time_get(const struct nrf_modem_dect_phy_time_get_event *evt)
 		fatal = true;
 		return;
 	}
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+	if (pps_correlation_active)
+	{
+		pps_correlation_timer_end =
+			nrfx_timer_capture(&pps_timer, NRF_TIMER_CC_CHANNEL2);
+		pps_correlation_modem_time = event_time;
+	}
+#endif
 	k_sem_give(&time_sem);
 }
+
+static bool pps_dppi_enabled;
+
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+static int pps_timer_init(void)
+{
+	int err;
+	uint8_t gpiote_channel;
+
+	if (nrf_clock_hf_src_get(NRF_CLOCK) != NRF_CLOCK_HFCLK_HIGH_ACCURACY)
+	{
+		nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED);
+		nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_HFCLKSTART);
+		for (int i = 0; i < 1000; i++)
+		{
+			if (nrf_clock_hf_src_get(NRF_CLOCK) == NRF_CLOCK_HFCLK_HIGH_ACCURACY)
+			{
+				break;
+			}
+			k_busy_wait(10);
+		}
+	}
+	LOG_INF("App Core HFCLK source: %s",
+		nrf_clock_hf_src_get(NRF_CLOCK) == NRF_CLOCK_HFCLK_HIGH_ACCURACY
+			? "HFXO (32 MHz)"
+			: "HFINT");
+
+	nrfx_timer_config_t timer_config =
+		NRFX_TIMER_DEFAULT_CONFIG(PPS_TIMER_FREQUENCY_HZ);
+	nrfx_gpiote_output_config_t output_config =
+		NRFX_GPIOTE_DEFAULT_OUTPUT_CONFIG;
+	nrfx_gpiote_task_config_t task_config = {
+		.task_ch = 0,
+		.polarity = NRF_GPIOTE_POLARITY_TOGGLE,
+		.init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
+	};
+
+	if (!device_is_ready(pps_pin.port))
+	{
+		LOG_ERR("PPS GPIO controller is not ready");
+		return -ENODEV;
+	}
+	if (pps_pin.pin >= 32U)
+	{
+		LOG_ERR("PPS pin must be on GPIO0");
+		return -EINVAL;
+	}
+
+	timer_config.bit_width = NRF_TIMER_BIT_WIDTH_32;
+	IRQ_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_TIMER_INST_GET(1)), 0,
+		    nrfx_timer_irq_handler, &pps_timer, 0);
+	irq_enable(NRFX_IRQ_NUMBER_GET(NRF_TIMER_INST_GET(1)));
+	err = nrfx_timer_init(&pps_timer, &timer_config, pps_timer_handler);
+	if (err)
+	{
+		LOG_ERR("PPS TIMER1 init failed, err %d", err);
+		return err;
+	}
+
+	err = nrfx_gpiote_init(&pps_gpiote, 0);
+	if (err && err != -EALREADY)
+	{
+		LOG_ERR("PPS GPIOTE init failed, err %d", err);
+		return err;
+	}
+	err = nrfx_gpiote_channel_alloc(&pps_gpiote, &gpiote_channel);
+	if (err)
+	{
+		LOG_ERR("PPS GPIOTE channel allocation failed, err %d", err);
+		return err;
+	}
+	task_config.task_ch = gpiote_channel;
+	err = nrfx_gpiote_output_configure(&pps_gpiote, pps_pin.pin,
+					   &output_config, &task_config);
+	if (err)
+	{
+		LOG_ERR("PPS GPIOTE output configuration failed, err %d", err);
+		return err;
+	}
+	nrfx_gpiote_out_task_enable(&pps_gpiote, pps_pin.pin);
+
+	pps_dppi_channel = nrfx_gppi_channel_alloc(0);
+	if (pps_dppi_channel < 0)
+	{
+		LOG_ERR("PPS DPPI channel allocation failed");
+		return -ENOMEM;
+	}
+
+	err = nrfx_gppi_ep_to_ch_attach(
+		nrfx_timer_compare_event_address_get(&pps_timer,
+						     NRF_TIMER_CC_CHANNEL0),
+		(uint8_t)pps_dppi_channel);
+	if (!err)
+	{
+		err = nrfx_gppi_ep_to_ch_attach(
+			nrfx_gpiote_out_task_address_get(&pps_gpiote, pps_pin.pin),
+			(uint8_t)pps_dppi_channel);
+	}
+	if (!err)
+	{
+		err = nrfx_gppi_ep_to_ch_attach(
+			nrfx_timer_compare_event_address_get(&pps_timer,
+						     NRF_TIMER_CC_CHANNEL1),
+			(uint8_t)pps_dppi_channel);
+	}
+	if (err)
+	{
+		LOG_ERR("PPS DPPI endpoint setup failed, err %d", err);
+		return err;
+	}
+
+	nrfx_timer_clear(&pps_timer);
+	nrfx_timer_compare_int_enable(&pps_timer, NRF_TIMER_CC_CHANNEL1);
+	nrfx_timer_enable(&pps_timer);
+	pps_hardware_ready = true;
+	return 0;
+}
+//TODO: Nach erstem correlate, Anzahl der Samples reduzieren
+static int pps_correlate(void)
+{
+	uint32_t best_duration = UINT32_MAX;
+	uint32_t best_timer = 0;
+	uint64_t best_modem = 0;
+
+	for (uint32_t i = 0; i < PPS_CORRELATION_SAMPLES; ++i)
+	{
+		(void)k_sem_take(&time_sem, K_NO_WAIT);
+		pps_correlation_timer_start =
+			nrfx_timer_capture(&pps_timer, NRF_TIMER_CC_CHANNEL2);
+		pps_correlation_active = true;
+
+		int err = nrf_modem_dect_phy_time_get();
+		if (err)
+		{
+			pps_correlation_active = false;
+			LOG_ERR("PPS correlation time_get failed, err %d", err);
+			return err;
+		}
+		if (k_sem_take(&time_sem, K_SECONDS(1)) != 0)
+		{
+			pps_correlation_active = false;
+			LOG_ERR("PPS correlation timed out");
+			return -ETIMEDOUT;
+		}
+		pps_correlation_active = false;
+
+		uint32_t duration = pps_correlation_timer_end -
+				   pps_correlation_timer_start;
+		if (duration < best_duration)
+		{
+			best_duration = duration;
+			best_timer = pps_correlation_timer_start + duration / 2U;
+			best_modem = pps_correlation_modem_time;
+			LOG_INF("PPS correlation sample %u: timer ticks %u, modem %" PRIu64
+				" (duration %u ticks)",
+				i + 1, best_timer, best_modem, duration);
+		}
+	}
+
+	if (best_duration == UINT32_MAX)
+	{
+		return -EIO;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sync_lock);
+	pps_timer_anchor = best_timer;
+	pps_modem_anchor = best_modem;
+	k_spin_unlock(&sync_lock, key);
+	LOG_INF("PPS timer correlation: %u timer ticks, modem %" PRIu64,
+		pps_timer_anchor, pps_modem_anchor);
+	return 0;
+}
+
+static int pps_schedule(void)
+{
+	int64_t master_now;
+	int64_t phase;
+	int64_t modem_delta;
+	int64_t delta_modem;
+	int64_t delta_timer;
+	uint32_t target_cc0;
+	uint32_t target_cc1;
+	uint32_t timer_now;
+	uint32_t current_cc0;
+	uint32_t current_cc1;
+	int32_t cc0_error;
+	int32_t cc1_error;
+
+	if (!pps_hardware_ready || !pps_phase_valid)
+	{
+		return 0;
+	}
+
+	master_now = (int64_t)modem_time - clock_offset;
+	phase = (master_now - (int64_t)pps_phase_ticks) %
+		(int64_t)PPS_PERIOD_TICKS;
+	if (phase < 0)
+	{
+		phase += PPS_PERIOD_TICKS;
+	}
+	modem_delta = (int64_t)PPS_PERIOD_TICKS - phase;
+	delta_modem = (int64_t)((uint64_t)modem_time +
+				(uint64_t)modem_delta) -
+		      (int64_t)pps_modem_anchor;
+	delta_timer = (delta_modem * 25LL) / 108LL;
+	target_cc0 = pps_timer_anchor + (uint32_t)delta_timer;
+	target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
+	timer_now = nrfx_timer_capture(&pps_timer, NRF_TIMER_CC_CHANNEL2);
+	current_cc0 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0];
+	current_cc1 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1];
+
+	/* Nicht eingreifen, während der 10-ms-Puls gerade HIGH ist */
+	if (pps_dppi_enabled &&
+	    (int32_t)(timer_now - current_cc0) >= 0 &&
+	    (int32_t)(timer_now - current_cc1) < 0)
+	{
+		return 0;
+	}
+
+	/* Nur auf die nächste Sekunde planen, wenn die Flanke schon vorbei ist (<= 10 us) */
+	if ((int32_t)(target_cc0 - timer_now) <= 160)
+	{
+		delta_modem += (int64_t)PPS_PERIOD_TICKS;
+		delta_timer = (delta_modem * 25LL) / 108LL;
+		target_cc0 = pps_timer_anchor + (uint32_t)delta_timer;
+		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
+	}
+	else if (pps_dppi_enabled &&
+		 (int32_t)(target_cc0 - timer_now) < (int32_t)(PPS_TIMER_FREQUENCY_HZ / 500U))
+	{
+		/* Flanke steht in < 2 ms bevor und ist schon programmiert -> nicht anfassen */
+		return 0;
+	}
+
+	if (pps_dppi_enabled)
+	{
+		cc0_error = (int32_t)(target_cc0 - current_cc0);
+		cc1_error = (int32_t)(target_cc1 - current_cc1);
+		if (cc0_error >= -1 && cc0_error <= 1 &&
+		    cc1_error >= -1 && cc1_error <= 1)
+		{
+			return 0;
+		}
+	}
+
+	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] = target_cc0;
+	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] = target_cc1;
+
+	if (!pps_dppi_enabled)
+	{
+		nrfx_gppi_channels_enable(0, NRFX_BIT((uint32_t)pps_dppi_channel));
+		pps_dppi_enabled = true;
+	}
+	return 0;
+}
+#endif
 
 #if defined(CONFIG_TDMA_ROLE_MASTER)
 /* The master also offers a 1PPS reference derived from the modem clock on
@@ -1369,6 +1675,14 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			memcpy(&pps_phase_ticks, pdu->eth, sizeof(pps_phase_ticks));
 			pps_phase_valid = true;
 		}
+		if (pps_phase_valid)
+		{
+			int err = pps_schedule();
+			if (err != 0)
+			{
+				LOG_ERR("Slave PPS scheduling failed: %d", err);
+			}
+		}
 		if (first)
 		{
 			LOG_INF("locked on master cycle %u, offset %lld ticks",
@@ -1378,14 +1692,13 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 		
 		if (!slave_first_rx_logged) {
 			slave_first_rx_logged = true;
-			int64_t uptime_ms = k_uptime_get();
 			#if IS_ENABLED(CONFIG_ENABLE_FIRST_TX_RX_LOGGING)
+			int64_t uptime_ms = k_uptime_get();
 			LOG_INF("[TIMING] Slave FIRST RX (Master Beacon) at uptime: %lld ms (STF: %u)", 
 					(long long)uptime_ms, stf);
 			#endif		
 		}
-		
-	}
+	}	
 #else
 	{
 		/* The master needs no sync, but the same expression the slave
@@ -1652,7 +1965,7 @@ static void dect_phy_event_handler(const struct nrf_modem_dect_phy_event *evt)
 		on_activate(&evt->activate);
 		break;
 	case NRF_MODEM_DECT_PHY_EVT_TIME:
-		on_time_get(&evt->time_get);
+		on_time_get(&evt->time_get, evt->time);
 		break;
 	case NRF_MODEM_DECT_PHY_EVT_COMPLETED:
 		on_op_complete(&evt->op_complete, evt->time);
@@ -1715,41 +2028,6 @@ static void scheduler_thread(void)
 				schedule_rx(next_rx_cycle++);
 			}
 #if defined(CONFIG_TDMA_ROLE_SLAVE)
-			k_spinlock_key_t key = k_spin_lock(&sync_lock);
-			
-			/* 1. Differenz zum letzten bereits kompensierten Zyklus berechnen */
-			uint32_t uncompensated_cycles = next_tx_cycle - last_compensated_cycle;
-
-			if (uncompensated_cycles > 1 && skew_valid) {
-				/* Drift nur für die NEUEN verpassten Zyklen berechnen */
-				uint32_t cycles_to_add = uncompensated_cycles - 1;
-				/* 1. Berechne den genauen Zuwachs an PPB-Ticks für die verpassten Zyklen */
-				int64_t added_ppb_ticks = learned_skew_ppb * (int64_t)CYCLE * (int64_t)cycles_to_add;
-
-				/* 2. Addiere den Zuwachs auf den Akkumulator-Puffer */
-				skew_remainder_ppb_ticks += added_ppb_ticks;
-
-				/* 3. Ermittle, wie viele GANZE Ticks im Puffer stecken (Division durch 1e9) */
-				int64_t drift_ticks = skew_remainder_ppb_ticks / 1000000000LL;
-
-				/* 4. Ziehe die verbuchten ganzen Ticks vom Puffer ab (der Rest bleibt für das nächste Mal) */
-				skew_remainder_ppb_ticks %= 1000000000LL;
-				
-				/* 5. Nur wenn mindestens 1 ganzer Tick aufgelaufen ist, Zeitgitter anpassen */
-				if (drift_ticks != 0) {
-					epoch += drift_ticks;
-					clock_offset += drift_ticks;
-					
-					#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
-					LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
-							(long long)drift_ticks, next_tx_cycle, (long long)learned_skew_ppb);
-					#endif
-				}
-
-				last_compensated_cycle = next_tx_cycle - 1;
-			}
-			k_spin_unlock(&sync_lock, key);
-
 			#if IS_ENABLED(CONFIG_ENABLE_COASTING_TIMEOUT)
 			if (cycles_since_sync() > MAX_COAST_CYCLES)
 			{
@@ -1784,6 +2062,24 @@ static void scheduler_thread(void)
 
 K_THREAD_DEFINE(scheduler_tid, 2048, scheduler_thread, NULL, NULL, NULL, 5, 0, 0);
 
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+static void pps_corr_thread(void)
+{
+	k_sem_take(&pps_corr_sem, K_FOREVER);
+
+	while (true)
+	{
+		k_sleep(K_SECONDS(2));
+		if (pps_hardware_ready && state == STATE_RUNNING)
+		{
+			(void)pps_correlate();
+		}
+	}
+}
+
+K_THREAD_DEFINE(pps_corr_tid, 1024, pps_corr_thread, NULL, NULL, NULL, 6, 0, 0);
+#endif
+
 /* Woken by tx_timer_expired() TX_LEAD_TICKS before each cycle's TX start_time.
  * Priority 0, the highest preemptible priority in the app, so nothing else in
  * the app delays the submit. spi_tid sits at the bottom (7): if "bad RX
@@ -1806,6 +2102,42 @@ static void tx_thread(void)
 		{
 			continue; /* draining/acquiring: no TX, no re-arm */
 		}
+#if defined(CONFIG_TDMA_ROLE_SLAVE)			
+		k_spinlock_key_t key = k_spin_lock(&sync_lock);
+
+		/* 1. Differenz zum letzten bereits kompensierten Zyklus berechnen */
+		uint32_t uncompensated_cycles = next_tx_cycle - last_compensated_cycle;
+
+		if (uncompensated_cycles > 1 && skew_valid) {
+			/* Drift nur für die NEUEN verpassten Zyklen berechnen */
+			uint32_t cycles_to_add = uncompensated_cycles - 1;
+			/* 1. Berechne den genauen Zuwachs an PPB-Ticks für die verpassten Zyklen */
+			int64_t added_ppb_ticks = learned_skew_ppb * (int64_t)CYCLE * (int64_t)cycles_to_add;
+
+			/* 2. Addiere den Zuwachs auf den Akkumulator-Puffer */
+			skew_remainder_ppb_ticks += added_ppb_ticks;
+
+			/* 3. Ermittle, wie viele GANZE Ticks im Puffer stecken (Division durch 1e9) */
+			int64_t drift_ticks = skew_remainder_ppb_ticks / 1000000000LL;
+
+			/* 4. Ziehe die verbuchten ganzen Ticks vom Puffer ab (der Rest bleibt für das nächste Mal) */
+			skew_remainder_ppb_ticks %= 1000000000LL;
+			
+			/* 5. Nur wenn mindestens 1 ganzer Tick aufgelaufen ist, Zeitgitter anpassen */
+			if (drift_ticks != 0) {
+				epoch += drift_ticks;
+				clock_offset += drift_ticks;
+				
+				#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
+				LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
+						(long long)drift_ticks, next_tx_cycle, (long long)learned_skew_ppb);
+				#endif
+			}
+
+			last_compensated_cycle = next_tx_cycle - 1;
+		}
+		k_spin_unlock(&sync_lock, key);
+#endif		
 		schedule_tx(next_tx_cycle);
 		arm_tx_timer(++next_tx_cycle);
 	}
@@ -1987,6 +2319,19 @@ int dect_init(void)
 		return -EIO;
 	}
 
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+	err = pps_timer_init();
+	if (err)
+	{
+		return err;
+	}
+	err = pps_correlate();
+	if (err)
+	{
+		return err;
+	}
+#endif
+
 	hwinfo_get_device_id((void *)&device_id, sizeof(device_id));
 	LOG_INF("activated, device ID %u, role %s", device_id, ROLE_NAME);
 
@@ -2028,5 +2373,8 @@ int dect_init(void)
 #endif
 
 	k_sem_give(&start_sem);
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+	k_sem_give(&pps_corr_sem);
+#endif
 	return 0;
 }

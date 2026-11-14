@@ -24,6 +24,10 @@
 };
 
 / {
+    zephyr,user {
+        pps-gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+    };
+
     aliases {
         drdy-pin = &drdy_out;
         sw0 = &button0;
