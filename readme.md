@@ -47,7 +47,9 @@ Connect each nRF9161 DK to its Teensy 4.1 using the following pinout. Ensure tha
 | :--- | :--- | :--- | :--- |
 | **RDY** | P0.08 | 14 | Data Ready interrupt (nRF → Teensy) |
 | **REQ** | P0.09 | 41 | Data Request interrupt (nRF → Teensy) |
-| **PPS** | COEX1 | 25 | 1 PPS output of the master nRF; the master's Teensy uses it as its time reference |
+| **PPS input** | P0.06 | — | COEX1 1 PPS input captured by TIMER1/DPPI |
+| **PPS output** | P0.07 | — | Local hardware PPS output for the logic analyzer |
+| **COEX1** | COEX1 | 25 | 1 PPS output of the master nRF; connect it to P0.06 on the receiving nRF |
 | **CSN** | P0.13 | 10 | Chip Select |
 | **MOSI** | P0.11 | 11 | Master Out Slave In |
 | **MISO** | P0.12 | 12 | Master In Slave Out |

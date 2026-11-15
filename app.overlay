@@ -25,6 +25,7 @@
 
 / {
     zephyr,user {
+        coex1-pps-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
         pps-gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
     };
 

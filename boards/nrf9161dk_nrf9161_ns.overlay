@@ -93,5 +93,6 @@ spi_slave: &spi2 {
         spi-req-gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
         spi-rdy-gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
         pps-gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+	coex1-pps-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
     };
 };
