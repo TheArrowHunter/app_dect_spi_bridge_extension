@@ -1062,6 +1062,7 @@ static int pps_correlate(void)
 	return 0;
 }
 
+#define PPS_CALIBRATION_OFFSET_TICKS 16U /* 16 * 62.5 ns = 1000 ns measured offset through 30 min of operation */
 static int pps_schedule(void)
 {
 	k_spinlock_key_t key = k_spin_lock(&sync_lock);
@@ -1100,8 +1101,8 @@ static int pps_schedule(void)
 	delta_modem = (int64_t)((uint64_t)m_now +
 				(uint64_t)modem_delta) -
 		      (int64_t)m_anchor;
-	delta_timer = (delta_modem * 25LL) / 108LL;
-	target_cc0 = t_anchor + (uint32_t)delta_timer;
+	delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL; /* +54 für Rundung */
+	target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
 	target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
 	timer_now = nrfx_timer_capture(&pps_timer, NRF_TIMER_CC_CHANNEL3);
 	current_cc0 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0];
