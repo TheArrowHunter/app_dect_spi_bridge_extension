@@ -26,7 +26,7 @@ LOG_MODULE_REGISTER(dect, LOG_LEVEL_INF);
 
 #define CONFIG_ENABLE_COASTING_TIMEOUT 0
 
-#define CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING 0
+#define CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING 1
 
 #define CONFIG_ENABLE_HISTOGRAM_LOGGING 0
 
@@ -331,20 +331,24 @@ void init_test_button(void)
     LOG_INF("Button 1 Toggle-Modus (TX On/Off) erfolgreich initialisiert.");
 }
 
-/* Drift-Messung über ein Block-Fenster */
-#define SKEW_CALC_INTERVAL_CYCLES  900u  /* Alle 300 Zyklen (~1 Sekunde) den Skew neu berechnen */
+/* Alpha-Beta-Filter Parameter (alpha = 1/32, beta = 1/2048 -> kritisch gedämpft) */
+#define SYNC_ALPHA_SHIFT           5   /* alpha = 1 / 32 */
+#define SYNC_BETA_SHIFT            11  /* beta  = 1 / 2048 */
 
-/* Prädiktive Skew-Kompensation für den Freilauf */
-static int64_t learned_skew_ppb = 0;   /* Gelernte Drift in Parts per Billion */
-static int64_t skew_anchor_offset = 0;
-static uint32_t skew_anchor_cycle = 0;
-static bool skew_anchor_valid = false;
+/* Hardware-Latenz-Kalibrierung für den 1PPS-Ausgang (TIMER1 @ 16 MHz -> 62.5 ns/Tick)
+ * 16 Ticks = 1000 ns (kompensiert Funk/PHY-Laufzeit + COEX1-Capture + P0.07-Treiber)
+ */
+#define PPS_CALIBRATION_OFFSET_TICKS 16
+
+/* Filter-Zustand (geschützt durch sync_lock) */
+static int64_t learned_skew_ppb = 0;         /* Gelernte Drift in Parts per Billion */
+static int64_t filter_frac_q16 = 0;          /* Sub-Tick-Rest des Offsets [-32768..32767] */
+static int64_t skew_ppb_rem = 0;             /* Sub-PPB-Rest für den Beta-Integrator */
+static uint32_t last_filter_cycle = 0;
 static bool skew_valid = false;
 
-/* Trackt den letzten Zyklus, für den der Skew bereits aufaddiert/kompensiert wurde */
+/* Trackt den letzten Zyklus, für den der Skew im Freilauf kompensiert wurde */
 static uint32_t last_compensated_cycle = 0;
-
-/* Speicher für den gebrochenen Rest (Remainder) in PPB-Ticks */
 static int64_t skew_remainder_ppb_ticks = 0;
 
 // erste Master/Slave Nachricht gesendet empfangen
@@ -1082,8 +1086,7 @@ static int pps_schedule(void)
 	uint32_t timer_now;
 	uint32_t current_cc0;
 	uint32_t current_cc1;
-	int32_t cc0_error;
-	int32_t cc1_error;
+	const int32_t min_lead_ticks = (int32_t)(PPS_TIMER_FREQUENCY_HZ / 500U); /* 2 ms */
 
 	if (!pps_hardware_ready || !pps_phase_valid)
 	{
@@ -1108,6 +1111,14 @@ static int pps_schedule(void)
 	current_cc0 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0];
 	current_cc1 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1];
 
+	if (!pps_dppi_enabled && (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
+	{
+		delta_modem += (int64_t)PPS_PERIOD_TICKS;
+		delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL;
+		target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
+		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
+	}
+
 	/* Nicht eingreifen, während der 10-ms-Puls gerade HIGH ist */
 	if (pps_dppi_enabled &&
 	    (int32_t)(timer_now - current_cc0) >= 0 &&
@@ -1120,26 +1131,22 @@ static int pps_schedule(void)
 	if ((int32_t)(target_cc0 - timer_now) <= 160)
 	{
 		delta_modem += (int64_t)PPS_PERIOD_TICKS;
-		delta_timer = (delta_modem * 25LL) / 108LL;
-		target_cc0 = t_anchor + (uint32_t)delta_timer;
+		delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL;
+		target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
 		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
 	}
 	else if (pps_dppi_enabled &&
-		 (int32_t)(target_cc0 - timer_now) < (int32_t)(PPS_TIMER_FREQUENCY_HZ / 500U))
+		 (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
 	{
 		/* Flanke steht in < 2 ms bevor und ist schon programmiert -> nicht anfassen */
 		return 0;
 	}
 
-	if (pps_dppi_enabled)
+	if (pps_dppi_enabled &&
+	    target_cc0 == current_cc0 &&
+	    target_cc1 == current_cc1)
 	{
-		cc0_error = (int32_t)(target_cc0 - current_cc0);
-		cc1_error = (int32_t)(target_cc1 - current_cc1);
-		if (cc0_error >= -1 && cc0_error <= 1 &&
-		    cc1_error >= -1 && cc1_error <= 1)
-		{
-			return 0;
-		}
+		return 0;
 	}
 
 	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] = target_cc0;
@@ -1466,60 +1473,92 @@ static void arm_tx_timer(uint32_t cycle)
  */
 static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 {
-	int64_t offset = (int64_t)stf - (int64_t)peer_tx;
-	uint64_t new_epoch = (uint64_t)((int64_t)peer_tx + offset -
-									(int64_t)cycle * CYCLE);
+	int64_t raw_offset = (int64_t)stf - (int64_t)peer_tx;
+	uint64_t raw_epoch = (uint64_t)((int64_t)peer_tx + raw_offset -
+					(int64_t)cycle * CYCLE);
 	k_spinlock_key_t key = k_spin_lock(&sync_lock);
 
-	if (sync_valid)
+	if (!sync_valid)
 	{
-		int64_t residual = (int64_t)new_epoch - (int64_t)epoch;
+		/* Kaltstart oder Re-Sync: Filter sofort auf den ersten Messwert setzen */
+		clock_offset = raw_offset;
+		filter_frac_q16 = 0;
+		learned_skew_ppb = 0;
+		skew_ppb_rem = 0;
+		skew_valid = false;
+		last_filter_cycle = cycle;
+	}
+	else
+	{
+		int64_t residual = (int64_t)raw_epoch - (int64_t)epoch;
 
+		/* Ausreißer verwerfen, bevor sie den Filterzustand verfälschen */
 		if (llabs(residual) > SYNC_ACCEPT_TICKS)
 		{
 			k_spin_unlock(&sync_lock, key);
 			atomic_inc(&stats.outlier);
 			LOG_WRN("anchor outlier cycle %u, residual %lld ticks",
-					cycle, residual);
+				cycle, residual);
 			return;
 		}
 
-		/* --- NEU: Skew über ein Fenster von z.B. 300 Zyklen (1 Sekunde) berechnen --- */
-		if (!skew_anchor_valid) {
-			skew_anchor_offset = offset;
-			skew_anchor_cycle = cycle;
-			skew_anchor_valid = true;
-		} else {
-			uint32_t elapsed_cycles = cycle - skew_anchor_cycle;
-
-			/* Erst nach ausreichend vielen Zyklen den Drift berechnen */
-			if (elapsed_cycles >= SKEW_CALC_INTERVAL_CYCLES) {
-				int64_t delta_offset = offset - skew_anchor_offset;
-				int64_t elapsed_ticks = (int64_t)elapsed_cycles * (int64_t)CYCLE;
-
-				/* Drift in PPB berechnen: (delta_ticks * 1e9) / total_ticks */
-				int64_t calculated_skew_ppb = (delta_offset * 1000000000LL) / elapsed_ticks;
-
-				if (!skew_valid) {
-					learned_skew_ppb = calculated_skew_ppb;
-					skew_valid = true;
-				} else {
-					/* Exponentielle Glättung über die Blöcke */
-					learned_skew_ppb = (learned_skew_ppb * 7 + calculated_skew_ppb) / 8;
-				}
-				#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
-				LOG_INF("[SKEW UPDATE] Calculated over %u cycles: delta %lld ticks -> learned_skew: %lld ppb",
-				        elapsed_cycles, delta_offset, (long long)learned_skew_ppb);
-				#endif
-				/* Ankerpunkt für den nächsten Block neu setzen */
-				skew_anchor_offset = offset;
-				skew_anchor_cycle = cycle;
-			}
+		uint32_t dt_cycles = cycle - last_filter_cycle;
+		if (dt_cycles == 0)
+		{
+			dt_cycles = 1;
 		}
 
-		/* The residual is the error of the previous prediction and is
-		 * the sync-quality measurement reported in dect_log_stats().
+		/* 1. Prädiktion: Geschätzten Offset um den gelernten Drift fortschreiben
+		 *    65536 / 1e9 == 128 / 1953125 (exakt gekürzt, kein Überlauf)
 		 */
+		int64_t elapsed_ticks = (int64_t)dt_cycles * (int64_t)CYCLE;
+		int64_t pred_offset = clock_offset;
+		int64_t pred_frac_q16 = filter_frac_q16 +
+			((learned_skew_ppb * elapsed_ticks * 128LL) / 1953125LL);
+
+		while (pred_frac_q16 >= 32768LL)
+		{
+			pred_offset++;
+			pred_frac_q16 -= 65536LL;
+		}
+		while (pred_frac_q16 < -32768LL)
+		{
+			pred_offset--;
+			pred_frac_q16 += 65536LL;
+		}
+
+		/* 2. Innovation (Abweichung Rohwert zu Prädiktion) in Q16-Ticks */
+		int64_t error_q16 = ((raw_offset - pred_offset) << 16) - pred_frac_q16;
+
+		/* 3. Alpha-Korrektur (alpha = 1/32, symmetrische Division gegen Bias) */
+		pred_frac_q16 += error_q16 / (1LL << SYNC_ALPHA_SHIFT);
+
+		while (pred_frac_q16 >= 32768LL)
+		{
+			pred_offset++;
+			pred_frac_q16 -= 65536LL;
+		}
+		while (pred_frac_q16 < -32768LL)
+		{
+			pred_offset--;
+			pred_frac_q16 += 65536LL;
+		}
+
+		/* 4. Beta-Korrektur für den Quarz-Drift (beta = 1/2048)
+		 *    1e9 / (65536 * 2048) == 1953125 / 262144
+		 */
+		int64_t beta_num = (error_q16 * 1953125LL) + skew_ppb_rem;
+		int64_t beta_den = 262144LL * elapsed_ticks;
+
+		learned_skew_ppb += beta_num / beta_den;
+		skew_ppb_rem = beta_num % beta_den;
+		skew_valid = true;
+
+		clock_offset = pred_offset;
+		filter_frac_q16 = pred_frac_q16;
+		last_filter_cycle = cycle;
+
+		/* Statistik-Residuen für dect_log_stats() */
 		if (resid.n == 0 || residual < resid.min)
 		{
 			resid.min = residual;
@@ -1532,17 +1571,15 @@ static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 		resid.n++;
 	}
 
-	epoch = new_epoch;
-	clock_offset = offset;
+	/* TDMA-Grid-Epoch aus dem geglätteten Offset ableiten */
+	epoch = (uint64_t)((int64_t)peer_tx + clock_offset -
+			   (int64_t)cycle * CYCLE);
 
-	/* BEIDE TRACKER ZURÜCKSETZEN: */
-    last_sync_cycle = cycle;         /* Unverändert: Für Statistiken, dect_log_stats() & MAX_COAST_CYCLES */
-    last_compensated_cycle = cycle;  /* Neu: Für das schrittweise Aufaddieren im Freilauf */
-	
-	/* reset bei neuem Hardware-RX */
+	last_sync_cycle = cycle;
+	last_compensated_cycle = cycle;
 	skew_remainder_ppb_ticks = 0;
-
 	sync_valid = true;
+
 	k_spin_unlock(&sync_lock, key);
 }
 #endif /* CONFIG_TDMA_ROLE_SLAVE */
@@ -2159,7 +2196,8 @@ static void tx_thread(void)
 		{
 			continue; /* draining/acquiring: no TX, no re-arm */
 		}
-#if defined(CONFIG_TDMA_ROLE_SLAVE)			
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+		bool pps_needs_update = false;			
 		k_spinlock_key_t key = k_spin_lock(&sync_lock);
 
 		/* 1. Differenz zum letzten bereits kompensierten Zyklus berechnen */
@@ -2184,6 +2222,7 @@ static void tx_thread(void)
 			if (drift_ticks != 0) {
 				epoch += drift_ticks;
 				clock_offset += drift_ticks;
+				pps_needs_update = true;
 				
 				#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
 				LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
@@ -2194,6 +2233,9 @@ static void tx_thread(void)
 			last_compensated_cycle = next_tx_cycle - 1;
 		}
 		k_spin_unlock(&sync_lock, key);
+		if (pps_needs_update) {
+			pps_schedule();
+		}
 #endif		
 		schedule_tx(next_tx_cycle);
 		arm_tx_timer(++next_tx_cycle);
