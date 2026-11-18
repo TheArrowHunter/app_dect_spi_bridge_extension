@@ -1503,19 +1503,29 @@ static void sync_update(uint32_t cycle, uint64_t peer_tx, uint64_t stf)
 			return;
 		}
 
+		/* 1. Prädiktion: Geschätzten Offset um den gelernten Drift fortschreiben
+		 *    65536 / 1e9 == 128 / 1953125 (exakt gekürzt, kein Überlauf)
+		 */
 		uint32_t dt_cycles = cycle - last_filter_cycle;
 		if (dt_cycles == 0)
 		{
 			dt_cycles = 1;
 		}
 
-		/* 1. Prädiktion: Geschätzten Offset um den gelernten Drift fortschreiben
-		 *    65536 / 1e9 == 128 / 1953125 (exakt gekürzt, kein Überlauf)
-		 */
+		/* Nur die Zyklen prädizieren, die tx_thread() im Coasting noch NICHT kompensiert hat */
+		int64_t unpred_cycles = (int64_t)cycle - (int64_t)last_compensated_cycle;
+		if (unpred_cycles < 0)
+		{
+			unpred_cycles = 0;
+		}
+
 		int64_t elapsed_ticks = (int64_t)dt_cycles * (int64_t)CYCLE;
+		int64_t unpred_ticks = unpred_cycles * (int64_t)CYCLE;
+
+		/* 1. Prädiktion nur über die noch unkompensierten Zyklen */
 		int64_t pred_offset = clock_offset;
 		int64_t pred_frac_q16 = filter_frac_q16 +
-			((learned_skew_ppb * elapsed_ticks * 128LL) / 1953125LL);
+			((learned_skew_ppb * unpred_ticks * 128LL) / 1953125LL);
 
 		while (pred_frac_q16 >= 32768LL)
 		{
