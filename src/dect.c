@@ -1770,14 +1770,15 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 
 		sync_update(cycle, unwrap_tx_start(tx_start_lo, stf), stf);
 
-		/* The PPS phase rides on keepalives only, so after a master reboot
-		 * it is refreshed at the next keepalive gap.
-		 */
-		if (len == 0)
-		{
-			memcpy(&pps_phase_ticks, pdu->eth, sizeof(pps_phase_ticks));
-			pps_phase_valid = true;
-		}
+		/* Aus peer_tx_start und dect_tx_ns direkt pps_phase_ticks rekonstruieren (funktioniert bei Daten & Keepalives) */
+		uint32_t tx_mod = (uint32_t)(peer_tx_start % PPS_PERIOD_TICKS);
+		uint32_t phase_est = (uint32_t)(((uint64_t)pdu->app.dect_tx_ns * TICKS_PER_MS + 999999ULL) / 1000000ULL);
+		pps_phase_ticks = (tx_mod >= phase_est)
+									? (tx_mod - phase_est)
+									: (tx_mod + (uint32_t)PPS_PERIOD_TICKS - phase_est);
+
+		pps_phase_valid = true;
+
 		if (pps_phase_valid)
 		{
 			int err = pps_schedule();
