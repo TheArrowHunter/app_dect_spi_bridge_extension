@@ -648,6 +648,7 @@ static struct gpio_callback coex1_cb_data;
 static uint32_t pps_timer_anchor;
 static uint64_t pps_modem_anchor;
 static bool pps_hardware_ready;
+static atomic_t pps_needs_update = ATOMIC_INIT(0);	
 
 static void pps_timer_handler(nrf_timer_event_t event_type, void *p_context)
 {
@@ -1148,10 +1149,10 @@ static int pps_schedule(void)
 	{
 		return 0;
 	}
-
+	unsigned int irq_key = irq_lock();
 	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] = target_cc0;
 	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] = target_cc1;
-
+	irq_unlock(irq_key);
 	if (!pps_dppi_enabled)
 	{
 		nrfx_gppi_channels_enable(0, NRFX_BIT((uint32_t)pps_output_dppi_channel));
@@ -2120,6 +2121,10 @@ static void scheduler_thread(void)
 				schedule_rx(next_rx_cycle++);
 			}
 #if defined(CONFIG_TDMA_ROLE_SLAVE)
+			if (atomic_cas(&pps_needs_update, 1, 0))
+			{
+				(void)pps_schedule();
+			}
 			#if IS_ENABLED(CONFIG_ENABLE_COASTING_TIMEOUT)
 			if (cycles_since_sync() > MAX_COAST_CYCLES)
 			{
@@ -2139,6 +2144,9 @@ static void scheduler_thread(void)
 
 				sync_valid = false;
 				k_spin_unlock(&sync_lock, key);
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+				atomic_set(&pps_needs_update, 0);
+#endif
 				pending_pcc.valid = false;
 				resid.n = 0;
 				resid.have_prev = false;
@@ -2196,8 +2204,8 @@ static void tx_thread(void)
 		{
 			continue; /* draining/acquiring: no TX, no re-arm */
 		}
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-		bool pps_needs_update = false;			
+#if defined(CONFIG_TDMA_ROLE_SLAVE)		
+		bool notify_pps = false;
 		k_spinlock_key_t key = k_spin_lock(&sync_lock);
 
 		/* 1. Differenz zum letzten bereits kompensierten Zyklus berechnen */
@@ -2222,19 +2230,23 @@ static void tx_thread(void)
 			if (drift_ticks != 0) {
 				epoch += drift_ticks;
 				clock_offset += drift_ticks;
-				pps_needs_update = true;
-				
-				#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
-				LOG_WRN("[COASTING] Extrapolated drift: %+lld ticks for cycle %u (learned: %lld ppb)",
-						(long long)drift_ticks, next_tx_cycle, (long long)learned_skew_ppb);
-				#endif
+				notify_pps = true;
 			}
+
+			#if IS_ENABLED(CONFIG_ENABLE_SKEW_COMPENSATION_LOGGING)
+			if (uncompensated_cycles == 2) {
+				LOG_WRN("[COASTING] Active at cycle %u (frozen skew: %lld ppb)",
+						next_tx_cycle, (long long)learned_skew_ppb);
+			}
+			#endif
 
 			last_compensated_cycle = next_tx_cycle - 1;
 		}
 		k_spin_unlock(&sync_lock, key);
-		if (pps_needs_update) {
-			pps_schedule();
+
+		if (notify_pps) {
+			atomic_set(&pps_needs_update, 1);
+			k_sem_give(&tick_sem);
 		}
 #endif		
 		schedule_tx(next_tx_cycle);
