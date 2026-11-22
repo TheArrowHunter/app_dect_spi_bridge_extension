@@ -865,6 +865,7 @@ static int pps_timer_init(void)
 {
 	int err;
 
+	// Gleicher Quarz für Timer und Modem um Drift zu eliminieren, daher HFCLK auf HFXO umstellen
 	if (nrf_clock_hf_src_get(NRF_CLOCK) != NRF_CLOCK_HFCLK_HIGH_ACCURACY)
 	{
 		nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED);
@@ -1112,6 +1113,8 @@ static int pps_schedule(void)
 	current_cc0 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0];
 	current_cc1 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1];
 
+	/* Nur auf die nächste Sekunde planen, wenn die Flanke schon vorbei ist oder kurz bevor steht (< 2 ms) und der DPPI-Ausgangskanal nicht aktiv ist,
+	da sonst der Interrupt nicht ausgeführt und die nächste Flanke nicht generiert wird. */
 	if (!pps_dppi_enabled && (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
 	{
 		delta_modem += (int64_t)PPS_PERIOD_TICKS;
@@ -1120,7 +1123,7 @@ static int pps_schedule(void)
 		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
 	}
 
-	/* Nicht eingreifen, während der 10-ms-Puls gerade HIGH ist */
+	/* Nicht eingreifen, während der 10-ms-Puls gerade HIGH ist, da sonst die Pin-Polarität dauerhaft invertiert wird. */
 	if (pps_dppi_enabled &&
 	    (int32_t)(timer_now - current_cc0) >= 0 &&
 	    (int32_t)(timer_now - current_cc1) < 0)
@@ -1139,7 +1142,8 @@ static int pps_schedule(void)
 	else if (pps_dppi_enabled &&
 		 (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
 	{
-		/* Flanke steht in < 2 ms bevor und ist schon programmiert -> nicht anfassen */
+		/* Flanke steht in < 2 ms bevor und ist schon programmiert -> nicht anfassen, da sonst während der Flanke eventuell der Zeitpunkt
+		überschrieben wird und somit die Flanke nicht ausführen würde.*/
 		return 0;
 	}
 
