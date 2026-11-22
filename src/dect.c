@@ -8,12 +8,6 @@
 #include <nrf_modem_dect_phy.h>
 #include <modem/nrf_modem_lib.h>
 #include <nrf_modem_dect_clock_sync.h>
-#include <nrfx_timer.h>
-#include <nrfx_gpiote.h>
-#include <helpers/nrfx_gppi.h>
-
-// Oszilator und Clock Control für die PPS-Interrupts
-#include <hal/nrf_clock.h>
 
 #include "bridge.h"
 
@@ -52,10 +46,6 @@ BUILD_ASSERT(CONFIG_CARRIER, "Carrier must be configured according to local regu
  * repeats this often.
  */
 #define PPS_PERIOD_TICKS (TICKS_PER_MS * 1000ULL)
-#define PPS_TIMER_FREQUENCY_HZ 16000000UL
-#define PPS_TIMER_PERIOD_TICKS PPS_TIMER_FREQUENCY_HZ
-#define PPS_PULSE_WIDTH_TICKS (PPS_TIMER_FREQUENCY_HZ / 100U)
-#define PPS_CORRELATION_SAMPLES 10U
 
 #define CYCLE_SUBSLOTS 16LL /* 3.333 ms */
 #define CYCLE (CYCLE_SUBSLOTS * SUBSLOT)
@@ -258,7 +248,7 @@ BUILD_ASSERT(TX_LEAD_TICKS >= MEASURED_RX_ACTIVE_TO_IDLE + MEASURED_TX_IDLE_TO_A
 #define TBS_BYTES (TBS_BITS / 8)
 
 /* A literal so it can size an array; asserted against the struct below. */
-#define APP_BYTES 30
+#define APP_BYTES 34
 #define DECT_MAX_ETH_BYTES (TBS_BYTES - APP_BYTES)
 
 
@@ -334,11 +324,6 @@ void init_test_button(void)
 /* Alpha-Beta-Filter Parameter (alpha = 1/32, beta = 1/2048 -> kritisch gedämpft) */
 #define SYNC_ALPHA_SHIFT           5   /* alpha = 1 / 32 */
 #define SYNC_BETA_SHIFT            11  /* beta  = 1 / 2048 */
-
-/* Hardware-Latenz-Kalibrierung für den 1PPS-Ausgang (TIMER1 @ 16 MHz -> 62.5 ns/Tick)
- * 16 Ticks = 1000 ns (kompensiert Funk/PHY-Laufzeit + COEX1-Capture + P0.07-Treiber)
- */
-#define PPS_CALIBRATION_OFFSET_TICKS 16
 
 /* Filter-Zustand (geschützt durch sync_lock) */
 static int64_t learned_skew_ppb = 0;         /* Gelernte Drift in Parts per Billion */
@@ -631,50 +616,6 @@ static bool pps_phase_valid;
 static uint64_t last_pulse_modem_time;
 static bool last_pulse_valid;
 
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-#define PPS_NODE DT_PATH(zephyr_user)
-static const struct gpio_dt_spec coex1_pps_pin =
-	GPIO_DT_SPEC_GET(PPS_NODE, coex1_pps_gpios);
-static const struct gpio_dt_spec pps_pin =
-	GPIO_DT_SPEC_GET(PPS_NODE, pps_gpios);
-static nrfx_timer_t pps_timer = NRFX_TIMER_INSTANCE(NRF_TIMER1);
-static nrfx_gpiote_t pps_gpiote = NRFX_GPIOTE_INSTANCE(NRF_GPIOTE);
-static int pps_output_dppi_channel;
-static int pps_input_dppi_channel;
-static uint8_t pps_output_gpiote_channel;
-static uint8_t coex1_gpiote_channel;
-static struct k_sem pps_edge_sem;
-static struct gpio_callback coex1_cb_data;
-static uint32_t pps_timer_anchor;
-static uint64_t pps_modem_anchor;
-static bool pps_hardware_ready;
-static atomic_t pps_needs_update = ATOMIC_INIT(0);	
-
-static void pps_timer_handler(nrf_timer_event_t event_type, void *p_context)
-{
-	ARG_UNUSED(p_context);
-	if (event_type == NRF_TIMER_EVENT_COMPARE1)
-	{
-		pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] =
-			pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] +
-			PPS_TIMER_PERIOD_TICKS;
-		pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] =
-			pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] +
-			PPS_TIMER_PERIOD_TICKS;
-	}
-}
-
-static void coex1_pps_gpio_callback(const struct device *dev,
-				    struct gpio_callback *cb,
-				    uint32_t pins)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-	k_sem_give(&pps_edge_sem);
-}
-#endif
-
 /* Modem ticks -> nanoseconds, truncated to the 32-bit field width of
  * protocol.h. Split into ms and remainder so the multiply cannot overflow.
  * Raw modem-clock time, used only as ns_since_pps()'s fallback before the PPS
@@ -699,6 +640,28 @@ static uint64_t ns_to_ticks(uint64_t ns)
 {
 	return (ns * (uint64_t)TICKS_PER_MS) / 1000000ULL;
 }
+
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+static uint32_t slave_pps_phase_ticks; /* Eigene COEX1-PPS-Phase des Slaves */
+static bool slave_pps_phase_valid;
+
+static uint32_t compute_slave_pps_phase_ns(int64_t offset)
+{
+	if (!pps_phase_valid || !slave_pps_phase_valid)
+	{
+		return 0;
+	}
+
+	int64_t diff = ((int64_t)slave_pps_phase_ticks - offset - (int64_t)pps_phase_ticks) %
+		       (int64_t)PPS_PERIOD_TICKS;
+	if (diff < 0)
+	{
+		diff += (int64_t)PPS_PERIOD_TICKS;
+	}
+
+	return (uint32_t)ticks_to_ns(diff);
+}
+#endif
 
 /* Modem ticks -> nanoseconds since the most recent COEX1 PPS edge, i.e. the
  * quantity the Teensys report from their PPS-disciplined PTP clocks.
@@ -808,9 +771,6 @@ K_SEM_DEFINE(time_sem, 0, 1);
 K_SEM_DEFINE(start_sem, 0, 1); /* dect_init() releases the scheduler */
 K_SEM_DEFINE(tick_sem, 0, 1);  /* something completed, re-evaluate */
 K_SEM_DEFINE(clock_sync_sem, 0, 1);
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-K_SEM_DEFINE(pps_corr_sem, 0, 1); // reevaluate PPS correlation
-#endif
 
 static void submit_rx(uint32_t handle, uint64_t start, uint64_t duration);
 
@@ -858,314 +818,6 @@ static void on_time_get(const struct nrf_modem_dect_phy_time_get_event *evt, uin
 	k_sem_give(&time_sem);
 }
 
-static bool pps_dppi_enabled;
-
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-static int pps_timer_init(void)
-{
-	int err;
-
-	// Gleicher Quarz für Timer und Modem um Drift zu eliminieren, daher HFCLK auf HFXO umstellen
-	if (nrf_clock_hf_src_get(NRF_CLOCK) != NRF_CLOCK_HFCLK_HIGH_ACCURACY)
-	{
-		nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED);
-		nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_HFCLKSTART);
-		for (int i = 0; i < 1000; i++)
-		{
-			if (nrf_clock_hf_src_get(NRF_CLOCK) == NRF_CLOCK_HFCLK_HIGH_ACCURACY)
-			{
-				break;
-			}
-			k_busy_wait(10);
-		}
-	}
-	LOG_INF("App Core HFCLK source: %s",
-		nrf_clock_hf_src_get(NRF_CLOCK) == NRF_CLOCK_HFCLK_HIGH_ACCURACY
-			? "HFXO (32 MHz)"
-			: "HFINT");
-
-	nrfx_timer_config_t timer_config =
-		NRFX_TIMER_DEFAULT_CONFIG(PPS_TIMER_FREQUENCY_HZ);
-	nrfx_gpiote_output_config_t output_config =
-		NRFX_GPIOTE_DEFAULT_OUTPUT_CONFIG;
-	nrfx_gpiote_task_config_t task_config = {
-		.task_ch = 0,
-		.polarity = NRF_GPIOTE_POLARITY_TOGGLE,
-		.init_val = NRF_GPIOTE_INITIAL_VALUE_LOW,
-	};
-
-	if (!device_is_ready(pps_pin.port) || pps_pin.pin >= 32U)
-	{
-		LOG_ERR("PPS output GPIO must be a ready GPIO0 pin");
-		return -ENODEV;
-	}
-	if (!gpio_is_ready_dt(&coex1_pps_pin) || coex1_pps_pin.pin >= 32U)
-	{
-		LOG_ERR("COEX1 PPS input must be a ready GPIO0 pin");
-		return -ENODEV;
-	}
-
-	/* 1. Eingangspin + steigenden Flanken-Interrupt über Zephyr-GPIO einrichten */
-	k_sem_init(&pps_edge_sem, 0, 1);
-
-	err = gpio_pin_configure_dt(&coex1_pps_pin, GPIO_INPUT);
-	if (err)
-	{
-		LOG_ERR("COEX1 GPIO configure failed, err %d", err);
-		return err;
-	}
-	err = gpio_pin_interrupt_configure_dt(&coex1_pps_pin, GPIO_INT_EDGE_RISING);
-	if (err)
-	{
-		LOG_ERR("COEX1 GPIO interrupt configure failed, err %d", err);
-		return err;
-	}
-	gpio_init_callback(&coex1_cb_data, coex1_pps_gpio_callback,
-			   BIT(coex1_pps_pin.pin));
-	err = gpio_add_callback(coex1_pps_pin.port, &coex1_cb_data);
-	if (err)
-	{
-		LOG_ERR("COEX1 GPIO add callback failed, err %d", err);
-		return err;
-	}
-
-	/* 2. TIMER1 initialisieren */
-	timer_config.bit_width = NRF_TIMER_BIT_WIDTH_32;
-	IRQ_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_TIMER_INST_GET(1)), 0,
-		    nrfx_timer_irq_handler, &pps_timer, 0);
-	irq_enable(NRFX_IRQ_NUMBER_GET(NRF_TIMER_INST_GET(1)));
-	err = nrfx_timer_init(&pps_timer, &timer_config, pps_timer_handler);
-	if (err)
-	{
-		LOG_ERR("PPS TIMER1 init failed, err %d", err);
-		return err;
-	}
-
-/* 3. GPIOTE-Ausgangskanal (pps_pin) + Event-Kanal (coex1_pps_pin) einrichten */
-	err = nrfx_gpiote_init(&pps_gpiote, 0);
-	if (err && err != -EALREADY)
-	{
-		LOG_ERR("PPS GPIOTE init failed, err %d", err);
-		return err;
-	}
-	err = nrfx_gpiote_channel_alloc(&pps_gpiote, &pps_output_gpiote_channel);
-	if (!err)
-	{
-		err = nrfx_gpiote_channel_alloc(&pps_gpiote, &coex1_gpiote_channel);
-	}
-	if (err)
-	{
-		LOG_ERR("PPS GPIOTE channel allocation failed, err %d", err);
-		return err;
-	}
-	task_config.task_ch = pps_output_gpiote_channel;
-	err = nrfx_gpiote_output_configure(&pps_gpiote, pps_pin.pin,
-					   &output_config, &task_config);
-	if (err)
-	{
-		LOG_ERR("PPS GPIOTE output configuration failed, err %d", err);
-		return err;
-	}
-	nrfx_gpiote_out_task_enable(&pps_gpiote, pps_pin.pin);
-
-	/* Reiner Hardware-Event-Kanal auf P0.06 für DPPI -> CC[2] (ohne eigenen IRQ) */
-	nrf_gpiote_event_configure(pps_gpiote.p_reg, coex1_gpiote_channel,
-				   coex1_pps_pin.pin, NRF_GPIOTE_POLARITY_LOTOHI);
-	nrf_gpiote_event_enable(pps_gpiote.p_reg, coex1_gpiote_channel);
-
-	/* 4. DPPI-Brücken für Ausgang (CC[0]/CC[1]) und Eingang (COEX1 -> CC[2]) */
-	pps_output_dppi_channel = nrfx_gppi_channel_alloc(0);
-	pps_input_dppi_channel = nrfx_gppi_channel_alloc(0);
-	if (pps_output_dppi_channel < 0 || pps_input_dppi_channel < 0)
-	{
-		LOG_ERR("PPS DPPI channel allocation failed");
-		return -ENOMEM;
-	}
-
-	err = nrfx_gppi_ep_to_ch_attach(
-		nrfx_timer_compare_event_address_get(&pps_timer,
-						     NRF_TIMER_CC_CHANNEL0),
-		(uint8_t)pps_output_dppi_channel);
-	if (!err)
-	{
-		err = nrfx_gppi_ep_to_ch_attach(
-			nrfx_gpiote_out_task_address_get(&pps_gpiote, pps_pin.pin),
-			(uint8_t)pps_output_dppi_channel);
-	}
-	if (!err)
-	{
-		err = nrfx_gppi_ep_to_ch_attach(
-			nrfx_timer_compare_event_address_get(&pps_timer,
-						     NRF_TIMER_CC_CHANNEL1),
-			(uint8_t)pps_output_dppi_channel);
-	}
-	if (!err)
-	{
-		err = nrfx_gppi_ep_to_ch_attach(
-			nrf_gpiote_event_address_get(
-				pps_gpiote.p_reg,
-				nrf_gpiote_in_event_get(coex1_gpiote_channel)),
-			(uint8_t)pps_input_dppi_channel);
-	}
-	if (!err)
-	{
-		err = nrfx_gppi_ep_to_ch_attach(
-			nrfx_timer_capture_task_address_get(&pps_timer,
-						      NRF_TIMER_CC_CHANNEL2),
-			(uint8_t)pps_input_dppi_channel);
-	}
-	if (err)
-	{
-		LOG_ERR("PPS DPPI endpoint setup failed, err %d", err);
-		return err;
-	}
-
-	nrfx_timer_clear(&pps_timer);
-	nrfx_timer_compare_int_enable(&pps_timer, NRF_TIMER_CC_CHANNEL1);
-	nrfx_gppi_channels_enable(0, NRFX_BIT((uint32_t)pps_input_dppi_channel));
-	nrfx_timer_enable(&pps_timer);
-	pps_hardware_ready = true;
-	return 0;
-}
-
-static int pps_correlate(void)
-{
-	(void)k_sem_take(&clock_sync_sem, K_NO_WAIT);
-	(void)k_sem_take(&pps_edge_sem, K_NO_WAIT);
-
-	if (k_sem_take(&pps_edge_sem, K_SECONDS(2)) != 0)
-	{
-		LOG_ERR("COEX1 PPS input edge timed out (CC[2]=%u)",
-			pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL2]);
-		return -ETIMEDOUT;
-	}
-
-	/* CC[2] wurde bereits in Hardware exakt bei der steigenden Flanke eingefroren */
-	uint32_t captured_timer = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL2];
-
-	/* Kurz warten, damit das Modem die Pulse-Info der gerade erfolgten Flanke bereit hat */
-	k_msleep(20);
-	last_pulse_valid = false;
-
-	int err = nrf_modem_dect_clock_sync_get_pulse_info(
-		NRF_MODEM_DECT_CLOCK_SYNC_PULSE_OUTGOING);
-	if (err)
-	{
-		LOG_ERR("PPS get_pulse_info failed, err %d", err);
-		return err;
-	}
-	if (k_sem_take(&clock_sync_sem, K_SECONDS(1)) != 0 || !last_pulse_valid)
-	{
-		LOG_ERR("PPS pulse info timed out");
-		return -ETIMEDOUT;
-	}
-
-	k_spinlock_key_t key = k_spin_lock(&sync_lock);
-	pps_timer_anchor = captured_timer;
-	pps_modem_anchor = last_pulse_modem_time;
-	k_spin_unlock(&sync_lock, key);
-
-	return 0;
-}
-
-#define PPS_CALIBRATION_OFFSET_TICKS 16U /* 16 * 62.5 ns = 1000 ns measured offset through 30 min of operation */
-static int pps_schedule(void)
-{
-	k_spinlock_key_t key = k_spin_lock(&sync_lock);
-	uint64_t m_now = modem_time;
-	int64_t c_offset = clock_offset;
-	uint32_t t_anchor = pps_timer_anchor;
-	uint64_t m_anchor = pps_modem_anchor;
-	k_spin_unlock(&sync_lock, key);
-
-	int64_t master_now;
-	int64_t phase;
-	int64_t modem_delta;
-	int64_t delta_modem;
-	int64_t delta_timer;
-	uint32_t target_cc0;
-	uint32_t target_cc1;
-	uint32_t timer_now;
-	uint32_t current_cc0;
-	uint32_t current_cc1;
-	const int32_t min_lead_ticks = (int32_t)(PPS_TIMER_FREQUENCY_HZ / 500U); /* 2 ms */
-
-	if (!pps_hardware_ready || !pps_phase_valid)
-	{
-		return 0;
-	}
-
-	master_now = (int64_t)m_now - c_offset;
-	phase = (master_now - (int64_t)pps_phase_ticks) %
-		(int64_t)PPS_PERIOD_TICKS;
-	if (phase < 0)
-	{
-		phase += PPS_PERIOD_TICKS;
-	}
-	modem_delta = (int64_t)PPS_PERIOD_TICKS - phase;
-	delta_modem = (int64_t)((uint64_t)m_now +
-				(uint64_t)modem_delta) -
-		      (int64_t)m_anchor;
-	delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL; /* +54 für Rundung */
-	target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
-	target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
-	timer_now = nrfx_timer_capture(&pps_timer, NRF_TIMER_CC_CHANNEL3);
-	current_cc0 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0];
-	current_cc1 = pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1];
-
-	/* Nur auf die nächste Sekunde planen, wenn die Flanke schon vorbei ist oder kurz bevor steht (< 2 ms) und der DPPI-Ausgangskanal nicht aktiv ist,
-	da sonst der Interrupt nicht ausgeführt und die nächste Flanke nicht generiert wird. */
-	if (!pps_dppi_enabled && (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
-	{
-		delta_modem += (int64_t)PPS_PERIOD_TICKS;
-		delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL;
-		target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
-		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
-	}
-
-	/* Nicht eingreifen, während der 10-ms-Puls gerade HIGH ist, da sonst die Pin-Polarität dauerhaft invertiert wird. */
-	if (pps_dppi_enabled &&
-	    (int32_t)(timer_now - current_cc0) >= 0 &&
-	    (int32_t)(timer_now - current_cc1) < 0)
-	{
-		return 0;
-	}
-
-	/* Nur auf die nächste Sekunde planen, wenn die Flanke schon vorbei ist (<= 10 us) */
-	if ((int32_t)(target_cc0 - timer_now) <= 160)
-	{
-		delta_modem += (int64_t)PPS_PERIOD_TICKS;
-		delta_timer = ((delta_modem * 25LL) + 54LL) / 108LL;
-		target_cc0 = t_anchor + (uint32_t)delta_timer - PPS_CALIBRATION_OFFSET_TICKS;
-		target_cc1 = target_cc0 + PPS_PULSE_WIDTH_TICKS;
-	}
-	else if (pps_dppi_enabled &&
-		 (int32_t)(target_cc0 - timer_now) < min_lead_ticks)
-	{
-		/* Flanke steht in < 2 ms bevor und ist schon programmiert -> nicht anfassen, da sonst während der Flanke eventuell der Zeitpunkt
-		überschrieben wird und somit die Flanke nicht ausführen würde.*/
-		return 0;
-	}
-
-	if (pps_dppi_enabled &&
-	    target_cc0 == current_cc0 &&
-	    target_cc1 == current_cc1)
-	{
-		return 0;
-	}
-	unsigned int irq_key = irq_lock();
-	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL0] = target_cc0;
-	pps_timer.p_reg->CC[NRF_TIMER_CC_CHANNEL1] = target_cc1;
-	irq_unlock(irq_key);
-	if (!pps_dppi_enabled)
-	{
-		nrfx_gppi_channels_enable(0, NRFX_BIT((uint32_t)pps_output_dppi_channel));
-		pps_dppi_enabled = true;
-	}
-	return 0;
-}
-#endif
-
 /* The master also offers a 1PPS reference derived from the modem clock on
  * COEX1 for external equipment and the slave uses it internally for synchronization 
  * of a hardware timer which then offers a 1PPS signal for external equipment, conditioned on the master 1PPS.
@@ -1197,6 +849,11 @@ static void dect_clock_sync_event_handler(const struct nrf_modem_dect_clock_sync
 			pps_phase_valid = true;
 			LOG_INF("PPS phase %u ticks (%lld ns) into the modem-time second",
 				pps_phase_ticks, (long long)ticks_to_ns(pps_phase_ticks));
+#else
+			slave_pps_phase_ticks = (uint32_t)(last_pulse_modem_time % PPS_PERIOD_TICKS);
+			slave_pps_phase_valid = true;
+			LOG_INF("Slave COEX1 PPS phase %u ticks (%lld ns)",
+				slave_pps_phase_ticks, (long long)ticks_to_ns(slave_pps_phase_ticks));
 #endif
 		}
 		else
@@ -1676,9 +1333,24 @@ static void deliver_rx(const struct dect_pdu *pdu, uint16_t eth_len, uint64_t rx
 	}
 
 	frame->hdr = pdu->app; /* carries t_rx and dect_tx_ns along */
-	memcpy(frame->eth, pdu->eth, eth_len);
+	if (eth_len > 0)
+	{
+		memcpy(frame->eth, pdu->eth, eth_len);
+	}
+	else
+	{
+		/* Explizite Kennung für gewollte 1PPS-Sync-Pakete ohne Ethernet-Payload */
+		frame->hdr.t_rx.eth_payload_len = 0;
+		frame->hdr.t_rx.delay_budget_ns = PPS_SYNC_MAGIC;
+	}
 
 	frame->hdr.nrf_rx_header.dect_rx_ns = ns_since_pps(rx_ts, pps_offset);
+
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+	frame->hdr.slave_pps_phase_ns = compute_slave_pps_phase_ns(clock_offset);
+#else
+	frame->hdr.slave_pps_phase_ns = 0;
+#endif
 
 	if (k_msgq_put(&bridge_spi_tx_q, &frame, K_NO_WAIT) != 0)
 	{
@@ -1783,14 +1455,6 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 
 		pps_phase_valid = true;
 
-		if (pps_phase_valid)
-		{
-			int err = pps_schedule();
-			if (err != 0)
-			{
-				LOG_ERR("Slave PPS scheduling failed: %d", err);
-			}
-		}
 		if (first)
 		{
 			LOG_INF("locked on master cycle %u, offset %lld ticks",
@@ -1955,6 +1619,20 @@ static void on_pdc(const struct nrf_modem_dect_phy_pdc_event *evt)
 			deliver_rx(pdu, len, modem_time, pps_offset);
 		}
 	}
+#if defined(CONFIG_TDMA_ROLE_SLAVE)
+	else if (pps_phase_valid && slave_pps_phase_valid)
+	{
+		static uint32_t last_pps_spi_cycle;
+		static bool sent_initial_pps;
+
+		if (!sent_initial_pps || (uint32_t)(cycle - last_pps_spi_cycle) >= 300U)
+		{
+			sent_initial_pps = true;
+			last_pps_spi_cycle = cycle;
+			deliver_rx(pdu, 0, modem_time, pps_offset);
+		}
+	}
+#endif
 
 	// In Nanosekunden umrechnen und in das Histogramm einsortieren
     int64_t delay_ns = ticks_to_ns(delay_ticks);
@@ -2136,10 +1814,6 @@ static void scheduler_thread(void)
 				schedule_rx(next_rx_cycle++);
 			}
 #if defined(CONFIG_TDMA_ROLE_SLAVE)
-			if (atomic_cas(&pps_needs_update, 1, 0))
-			{
-				(void)pps_schedule();
-			}
 			#if IS_ENABLED(CONFIG_ENABLE_COASTING_TIMEOUT)
 			if (cycles_since_sync() > MAX_COAST_CYCLES)
 			{
@@ -2159,9 +1833,7 @@ static void scheduler_thread(void)
 
 				sync_valid = false;
 				k_spin_unlock(&sync_lock, key);
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-				atomic_set(&pps_needs_update, 0);
-#endif
+
 				pending_pcc.valid = false;
 				resid.n = 0;
 				resid.have_prev = false;
@@ -2176,26 +1848,6 @@ static void scheduler_thread(void)
 }
 
 K_THREAD_DEFINE(scheduler_tid, 2048, scheduler_thread, NULL, NULL, NULL, 5, 0, 0);
-
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-static void pps_corr_thread(void)
-{
-	k_sem_take(&pps_corr_sem, K_FOREVER);
-
-	while (true)
-	{
-		if (pps_hardware_ready)
-		{
-			(void)pps_correlate();
-		}
-		else
-		{
-			k_sleep(K_MSEC(100));
-		}
-	}
-}
-K_THREAD_DEFINE(pps_corr_tid, 1024, pps_corr_thread, NULL, NULL, NULL, 6, 0, 0);
-#endif
 
 /* Woken by tx_timer_expired() TX_LEAD_TICKS before each cycle's TX start_time.
  * Priority 0, the highest preemptible priority in the app, so nothing else in
@@ -2258,11 +1910,6 @@ static void tx_thread(void)
 			last_compensated_cycle = next_tx_cycle - 1;
 		}
 		k_spin_unlock(&sync_lock, key);
-
-		if (notify_pps) {
-			atomic_set(&pps_needs_update, 1);
-			k_sem_give(&tick_sem);
-		}
 #endif		
 		schedule_tx(next_tx_cycle);
 		arm_tx_timer(++next_tx_cycle);
@@ -2385,7 +2032,6 @@ int dect_init(void)
 	}
 	k_sem_take(&clock_sync_sem, K_FOREVER);
 
-#if defined(CONFIG_TDMA_ROLE_MASTER)
 	/* Calibrate once which modem tick the PPS pulse falls on, see
 	 * ns_since_pps().
 	 */
@@ -2396,7 +2042,14 @@ int dect_init(void)
 		return err;
 	}
 	k_sem_take(&clock_sync_sem, K_FOREVER);
+
+#if defined(CONFIG_TDMA_ROLE_MASTER)
 	if (!pps_phase_valid)
+	{
+		return -EIO;
+	}
+#else
+	if (!slave_pps_phase_valid)
 	{
 		return -EIO;
 	}
@@ -2445,19 +2098,6 @@ int dect_init(void)
 		return -EIO;
 	}
 
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-	err = pps_timer_init();
-	if (err)
-	{
-		return err;
-	}
-	err = pps_correlate();
-	if (err)
-	{
-		return err;
-	}
-#endif
-
 	hwinfo_get_device_id((void *)&device_id, sizeof(device_id));
 	LOG_INF("activated, device ID %u, role %s", device_id, ROLE_NAME);
 
@@ -2499,8 +2139,5 @@ int dect_init(void)
 #endif
 
 	k_sem_give(&start_sem);
-#if defined(CONFIG_TDMA_ROLE_SLAVE)
-	k_sem_give(&pps_corr_sem);
-#endif
 	return 0;
 }

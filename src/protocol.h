@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define PPS_SYNC_MAGIC 0x50505331U /* "PPS1" - Kennung für reine 1PPS-Sync-Pakete */
+
 typedef struct __attribute__((packed))
 {
     uint16_t eth_payload_len; // Length of raw Ethernet frame to transmit later
@@ -30,6 +32,7 @@ typedef struct __attribute__((packed))
 
     uint32_t nrf_spi_rx_ns; // nrf spi rx Timestamp
     uint32_t dect_tx_ns;    // nrf dect tx Timestamp
+    uint32_t slave_pps_phase_ns; // Phase des Slave-COEX1 in der Master-1PPS-Sekunde [ns]
 
     t_rx_header t_rx; // 14 bytes inherited from Teensy
 

@@ -89,7 +89,7 @@ static void spi_xfer(const struct spi_buf_set *tx, const struct spi_buf_set *rx)
 	 * peripheral whose ISR never runs fails loudly instead of hanging.
 	 */
 	for (uint32_t spins = 0;
-		 nrf_spis_semaphore_status_get(SPIS_REG) == NRF_SPIS_SEMSTAT_CPU;
+		 nrf_spis_semaphore_status_get(SPIS_REG) != NRF_SPIS_SEMSTAT_CPU;
 		 spins++)
 	{
 		if (spins >= SPI_ARM_SEM_MAX_SPINS)
@@ -286,7 +286,7 @@ static void spi_slave_thread(void)
  * len_err growth in spi_bridge_log_stats(). If that happens, raise this
  * priority, at least above the system workqueue.
  */
-K_THREAD_DEFINE(spi_tid, 4096, spi_slave_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(spi_tid, 4096, spi_slave_thread, NULL, NULL, NULL, 4, 0, 0);
 
 /* ------------------------------------------------------------------------- */
 

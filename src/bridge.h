@@ -49,8 +49,8 @@ struct bridge_frame
 } __packed;
 
 BUILD_ASSERT(sizeof(t_rx_header) == 14, "t_rx_header changed size");
-BUILD_ASSERT(sizeof(nrf_tx_rx_header) == 30, "nrf_tx_rx_header changed size");
-BUILD_ASSERT(sizeof(t_tx_header) == 38, "t_tx_header changed size");
+BUILD_ASSERT(sizeof(nrf_tx_rx_header) == 34, "nrf_tx_rx_header changed size");
+BUILD_ASSERT(sizeof(t_tx_header) == 42, "t_tx_header changed size");
 BUILD_ASSERT(offsetof(nrf_tx_rx_header, t_rx) + sizeof(t_rx_header) ==
 				 sizeof(nrf_tx_rx_header),
 			 "t_rx must stay last in nrf_tx_rx_header: the SPI RX writes in place");
